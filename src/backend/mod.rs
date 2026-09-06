@@ -13,6 +13,8 @@ pub mod render;
 
 pub mod kms;
 pub mod winit;
+#[cfg(feature = "renderer_vulkan")]
+pub mod winit_vulkan;
 pub mod x11;
 // TODO
 // pub mod wayland; // tbd in smithay
@@ -25,6 +27,12 @@ pub fn init_backend_auto(
     let res = match std::env::var("COSMIC_BACKEND") {
         Ok(x) if x == "x11" => x11::init_backend(dh, event_loop, state),
         Ok(x) if x == "winit" => winit::init_backend(dh, event_loop, state),
+        #[cfg(feature = "renderer_vulkan")]
+        Ok(x) if x == "winit-vulkan" => winit_vulkan::init_backend(dh, event_loop, state),
+        #[cfg(not(feature = "renderer_vulkan"))]
+        Ok(x) if x == "winit-vulkan" => Err(anyhow!(
+            "COSMIC_BACKEND=winit-vulkan requires the renderer_vulkan feature"
+        )),
         Ok(x) if x == "kms" => kms::init_backend(dh, event_loop, state),
         Ok(_) => unimplemented!("There is no backend with this identifier"),
         Err(_) => {
