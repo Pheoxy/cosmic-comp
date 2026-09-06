@@ -1012,7 +1012,7 @@ impl KeyboardTarget<State> for CosmicMapped {
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         match &self.element {
             CosmicMappedInternal::Stack(s) => {

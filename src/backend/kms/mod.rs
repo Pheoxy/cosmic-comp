@@ -15,6 +15,8 @@ use calloop::{
 };
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputState};
 use indexmap::IndexMap;
+use render::KmsGraphics;
+#[cfg(not(feature = "renderer_vulkan"))]
 use render::gles::GbmGlowBackend;
 use smithay::{
     backend::{
@@ -72,7 +74,7 @@ pub struct KmsState {
     pub primary_node: Arc<RwLock<Option<DrmNode>>>,
     // Mesa llvmpipe renderer, if supported and there are no render nodes
     pub software_renderer: Option<GlowRenderer>,
-    pub api: GpuManager<GbmGlowBackend<DrmDeviceFd>>,
+    pub api: GpuManager<KmsGraphics>,
 
     pub session: LibSeatSession,
     libinput: Libinput,
@@ -84,7 +86,7 @@ pub struct KmsState {
 pub struct KmsGuard<'a> {
     pub drm_devices: IndexMap<DrmNode, LockedDevice<'a>>,
     pub primary_node: Arc<RwLock<Option<DrmNode>>>,
-    api: &'a mut GpuManager<GbmGlowBackend<DrmDeviceFd>>,
+    api: &'a mut GpuManager<KmsGraphics>,
     session: &'a LibSeatSession,
 }
 
@@ -130,7 +132,25 @@ pub fn init_backend(
         input_devices: HashMap::new(),
         primary_node: Arc::new(RwLock::new(None)),
         software_renderer: None,
-        api: GpuManager::new(GbmGlowBackend::new()).context("Failed to initialize gpu backend")?,
+        api: {
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                GpuManager::new(GbmGlowBackend::new()).context("Failed to initialize gpu backend")?
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            {
+                use smithay::backend::{
+                    renderer::multigpu::vulkan::VulkanGbmBackend,
+                    vulkan::{Instance, version::Version},
+                };
+                let instance = Instance::new(Version::VERSION_1_3, None)
+                    .context("Failed to create Vulkan instance")?;
+                GpuManager::new(
+                    VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true),
+                )
+                .context("Failed to initialize Vulkan gpu backend")?
+            }
+        },
 
         session,
         libinput: libinput_context,
@@ -520,6 +540,7 @@ impl State {
                     node
                 ))?;
 
+            #[cfg(not(feature = "renderer_vulkan"))]
             if let Some(drm) = self.common.wl_drm_state.as_mut() {
                 drm.update_device(device_path, primary_formats);
             } else {
@@ -530,15 +551,20 @@ impl State {
                     kms.dmabuf_global.as_ref().unwrap(),
                 ));
             }
+            #[cfg(feature = "renderer_vulkan")]
+            let _ = (device_path, primary_formats);
         } else if kms.software_renderer.is_none() {
             info!("Failed to find a suitable gpu, using software renderingr");
-            kms.software_renderer = match software_renderer() {
-                Ok(renderer) => Some(renderer),
-                Err(err) => {
-                    error!(?err, "Failed to initialize software EGL renderer.");
-                    None
-                }
-            };
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                kms.software_renderer = match software_renderer() {
+                    Ok(renderer) => Some(renderer),
+                    Err(err) => {
+                        error!(?err, "Failed to initialize software EGL renderer.");
+                        None
+                    }
+                };
+            }
 
             if let Some(drm) = self.common.wl_drm_state.take() {
                 remove_global_with_timer(dh, &self.common.event_loop_handle, drm.global().clone());
@@ -675,20 +701,34 @@ impl KmsState {
             false
         };
 
-        let egl = device
-            .inner
-            .egl
-            .as_ref()
-            .context("EGL initialization Error")?;
-        egl.display
-            .create_image_from_dmabuf(&dmabuf)
-            .inspect(|image| unsafe {
-                smithay::backend::egl::ffi::egl::DestroyImageKHR(
-                    **egl.display.get_display_handle(),
-                    *image,
-                );
-            })
-            .context("Failed to create EGLImage from dmabuf")?;
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let egl = device
+                .inner
+                .egl
+                .as_ref()
+                .context("EGL initialization Error")?;
+            egl.display
+                .create_image_from_dmabuf(&dmabuf)
+                .inspect(|image| unsafe {
+                    smithay::backend::egl::ffi::egl::DestroyImageKHR(
+                        **egl.display.get_display_handle(),
+                        *image,
+                    );
+                })
+                .context("Failed to create EGLImage from dmabuf")?;
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let renderer = self
+                .api
+                .single_renderer(&device.inner.render_node)
+                .context("Vulkan renderer missing for dmabuf admit")?;
+            anyhow::ensure!(
+                renderer.as_ref().sampled_dmabuf_import_supported(&dmabuf),
+                "sampled dmabuf not supported on Vulkan renderer"
+            );
+        }
 
         let node = device.inner.render_node;
         dmabuf.set_node(node);

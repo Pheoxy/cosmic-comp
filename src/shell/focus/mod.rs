@@ -419,7 +419,7 @@ fn update_focus_state(
                     &MotionEvent {
                         location: new_pos.as_logical(),
                         serial: SERIAL_COUNTER.next_serial(),
-                        time: 0,
+                        time: InputTime::from_millis(0),
                     },
                 );
             }
@@ -768,7 +768,7 @@ fn update_pointer_focus(state: &mut State, seat: &Seat<State>) {
                 &MotionEvent {
                     location: pointer.current_location(),
                     serial: SERIAL_COUNTER.next_serial(),
-                    time: state.common.clock.now().as_millis(),
+                    time: InputTime::from_millis(state.common.clock.now().as_millis()),
                 },
             );
         }

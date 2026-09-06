@@ -5,7 +5,10 @@ use smithay::{
     input::pointer::PointerHandle,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point},
-    wayland::{pointer_constraints::PointerConstraintsHandler, seat::WaylandFocus},
+    wayland::{
+        pointer_constraints::{ConstraintRemove, PointerConstraintsHandler},
+        seat::WaylandFocus,
+    },
 };
 
 pub use smithay::wayland::pointer_constraints::{PointerConstraintRef, with_pointer_constraint};
@@ -76,7 +79,12 @@ impl PointerConstraintsHandler for State {
         }
     }
 
-    fn remove_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+    fn remove_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        _constraint_remove: ConstraintRemove,
+    ) {
         if with_pointer_constraint(surface, pointer, |constraint| constraint.is_none()) {
             let seat = self
                 .common

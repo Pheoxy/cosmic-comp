@@ -112,6 +112,8 @@ features = [
     "wayland_frontend",
     "xwayland",
 ]
+# renderer_vulkan is opt-in via the feature below; do not enable here so GLES
+# epoch builds stay on Glow.
 
 [dependencies.smithay-egui]
 version = "0.2.0"
@@ -121,6 +123,9 @@ optional = true
 [features]
 debug = ["egui", "egui_plot", "smithay-egui", "anyhow/backtrace"]
 default = ["systemd"]
+# Exclusive KMS VulkanRenderer path (smithay VulkanGbmBackend). Default COSMIC
+# stays GLES. Used by the mordred cosmic-vulkan specialisation.
+renderer_vulkan = ["smithay/renderer_vulkan"]
 logind = ["logind-zbus"]
 systemd = ["libsystemd", "logind"]
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default"]
@@ -146,4 +151,5 @@ lto = "fat"
 cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
 
 [patch.crates-io]
-smithay = { git = "https://github.com/smithay/smithay.git", rev = "5fb12b8" }
+# GLES epoch pin: 5fb12b8. Vulkan specialisation uses the local e3d461a renderer branch.
+smithay = { path = "../smithay" }

@@ -273,7 +273,7 @@ impl PointerFocusTarget {
         };
 
         let cursor_hotspot = if let Some(CursorGeometry { hotspot, .. }) =
-            seat.cursor_geometry((0.0, 0.0), Duration::from_millis(event.time as u64).into())
+            seat.cursor_geometry((0.0, 0.0), Duration::from_millis(event.time.millis() as u64).into())
         {
             hotspot
         } else {
@@ -417,7 +417,7 @@ impl PointerTarget<State> for PointerFocusTarget {
     fn frame(&self, seat: &Seat<State>, data: &mut State) {
         self.inner_pointer_target().frame(seat, data);
     }
-    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {
+    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {
         let toplevel = self.toplevel(&data.common.shell.read());
         if let Some(element) = toplevel {
             for session in element.cursor_sessions() {
@@ -593,7 +593,7 @@ impl DndFocus<State> for PointerFocusTarget {
         offer: Option<&mut CosmicOfferData<S>>,
         seat: &Seat<State>,
         location: Point<f64, Logical>,
-        time: u32,
+        time: InputTime,
     ) {
         match self {
             PointerFocusTarget::WlSurface { surface, .. } => {
@@ -695,7 +695,7 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         if let Some(inner) = self.inner_keyboard_target() {
             inner.key(seat, data, key, state, serial, time);

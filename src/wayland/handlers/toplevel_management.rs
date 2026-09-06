@@ -124,7 +124,7 @@ impl ToplevelManagementHandler for State {
                         &MotionEvent {
                             location: new_pos.to_f64().as_logical(),
                             serial,
-                            time: self.common.clock.now().as_millis(),
+                            time: InputTime::from_millis(self.common.clock.now().as_millis()),
                         },
                     );
                     ptr.frame(self);

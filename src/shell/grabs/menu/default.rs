@@ -13,7 +13,7 @@ use crate::{
         grabs::ReleaseMode,
     },
     state::State,
-    utils::{prelude::SeatExt, screenshot::screenshot_window},
+    utils::{prelude::{InputTime, SeatExt}, screenshot::screenshot_window},
     wayland::protocols::workspace::WorkspaceHandle,
 };
 
@@ -398,7 +398,7 @@ pub fn window_items(
                                     &MotionEvent {
                                         location: loc.as_logical().to_f64(),
                                         serial,
-                                        time: state.common.clock.now().as_millis(),
+                                        time: InputTime::from_millis(state.common.clock.now().as_millis()),
                                     },
                                 );
                                 pointer.frame(state);
@@ -433,7 +433,7 @@ pub fn window_items(
                                     &MotionEvent {
                                         location: loc.as_logical().to_f64(),
                                         serial,
-                                        time: state.common.clock.now().as_millis(),
+                                        time: InputTime::from_millis(state.common.clock.now().as_millis()),
                                     },
                                 );
                                 pointer.frame(state);
@@ -468,7 +468,7 @@ pub fn window_items(
                                     &MotionEvent {
                                         location: loc.as_logical().to_f64(),
                                         serial,
-                                        time: state.common.clock.now().as_millis(),
+                                        time: InputTime::from_millis(state.common.clock.now().as_millis()),
                                     },
                                 );
                                 pointer.frame(state);
@@ -503,7 +503,7 @@ pub fn window_items(
                                     &MotionEvent {
                                         location: loc.as_logical().to_f64(),
                                         serial,
-                                        time: state.common.clock.now().as_millis(),
+                                        time: InputTime::from_millis(state.common.clock.now().as_millis()),
                                     },
                                 );
                                 pointer.frame(state);

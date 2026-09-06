@@ -9,6 +9,7 @@ pub use super::geometry::*;
 pub use crate::shell::{SeatExt, Shell, Workspace};
 pub use crate::state::{Common, State};
 pub use crate::wayland::handlers::xdg_shell::popup::update_reactive_popups;
+pub use smithay::backend::input::InputTime;
 use crate::{config::EdidProduct, shell::zoom::OutputZoomState};
 
 use std::{

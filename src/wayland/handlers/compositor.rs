@@ -327,7 +327,7 @@ impl CompositorHandler for State {
                     std::mem::drop(shell);
                     seat.get_pointer()
                         .unwrap()
-                        .unset_grab(self, SERIAL_COUNTER.next_serial(), 0);
+                        .unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::from_millis(0));
                     return;
                 }
             }

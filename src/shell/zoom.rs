@@ -1023,7 +1023,7 @@ impl PointerTarget<State> for ZoomFocusTarget {
         }
     }
 
-    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {
+    fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {
         match self {
             ZoomFocusTarget::Main(elem) => PointerTarget::leave(elem, seat, data, serial, time),
             ZoomFocusTarget::Menu(elem) => PointerTarget::leave(elem, seat, data, serial, time),

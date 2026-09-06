@@ -271,7 +271,7 @@ impl State {
                     trace!(?keycode, ?state, "key");
 
                     let serial = SERIAL_COUNTER.next_serial();
-                    let time = Event::time_msec(&event);
+                    let time = Event::time(&event);
                     let keyboard = seat.get_keyboard().unwrap();
                     let previous_modifiers = keyboard.modifier_state();
                     if let Some((action, pattern)) = keyboard
@@ -397,7 +397,7 @@ impl State {
                         &RelativeMotionEvent {
                             delta: event.delta(),
                             delta_unaccel: event.delta_unaccel(),
-                            utime: event.time(),
+                            time: event.time(),
                         },
                     );
 
@@ -638,7 +638,7 @@ impl State {
                         &MotionEvent {
                             location: position.as_logical(),
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                     ptr.frame(self);
@@ -753,7 +753,7 @@ impl State {
                         &MotionEvent {
                             location: position.as_logical(),
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                     ptr.frame(self);
@@ -1005,7 +1005,7 @@ impl State {
                         button,
                         event.state(),
                         serial,
-                        event.time_msec(),
+                        event.time(),
                     );
                 }
 
@@ -1017,12 +1017,12 @@ impl State {
                             button,
                             state: event.state(),
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                     ptr.frame(self);
                 } else if event.state() == ButtonState::Released {
-                    ptr.unset_grab(self, serial, event.time_msec())
+                    ptr.unset_grab(self, serial, event.time())
                 }
             }
             InputEvent::PointerAxis { event, .. } => {
@@ -1073,7 +1073,7 @@ impl State {
                             self.update_zoom(&seat, change, event.source() == AxisSource::Wheel);
                         }
                     } else {
-                        let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
+                        let mut frame = AxisFrame::new(event.time()).source(event.source());
                         let horizontal_amount = event
                             .amount(Axis::Horizontal)
                             .or_else(|| Some(event.amount_v120(Axis::Horizontal)? * 15.0 / 120.));
@@ -1142,7 +1142,7 @@ impl State {
                             self,
                             &GestureSwipeBeginEvent {
                                 serial,
-                                time: event.time_msec(),
+                                time: event.time(),
                                 fingers: event.fingers(),
                             },
                         );
@@ -1163,7 +1163,7 @@ impl State {
                     if let Some(ref mut gesture_state) = self.common.gesture_state {
                         let first_update = gesture_state.update(
                             event.delta(),
-                            Duration::from_millis(event.time_msec() as u64),
+                            Duration::from_millis(event.time().millis() as u64),
                         );
                         // Decide on action if first update
                         if first_update {
@@ -1239,7 +1239,7 @@ impl State {
                         pointer.gesture_swipe_update(
                             self,
                             &GestureSwipeUpdateEvent {
-                                time: event.time_msec(),
+                                time: event.time(),
                                 delta: event.delta(),
                             },
                         );
@@ -1288,7 +1288,7 @@ impl State {
                             self,
                             &GestureSwipeEndEvent {
                                 serial,
-                                time: event.time_msec(),
+                                time: event.time(),
                                 cancelled: event.cancelled(),
                             },
                         );
@@ -1311,7 +1311,7 @@ impl State {
                         self,
                         &GesturePinchBeginEvent {
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                             fingers: event.fingers(),
                         },
                     );
@@ -1331,7 +1331,7 @@ impl State {
                     pointer.gesture_pinch_update(
                         self,
                         &GesturePinchUpdateEvent {
-                            time: event.time_msec(),
+                            time: event.time(),
                             delta: event.delta(),
                             scale: event.scale(),
                             rotation: event.rotation(),
@@ -1355,7 +1355,7 @@ impl State {
                         self,
                         &GesturePinchEndEvent {
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                             cancelled: event.cancelled(),
                         },
                     );
@@ -1377,7 +1377,7 @@ impl State {
                         self,
                         &GestureHoldBeginEvent {
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                             fingers: event.fingers(),
                         },
                     );
@@ -1399,7 +1399,7 @@ impl State {
                         self,
                         &GestureHoldEndEvent {
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                             cancelled: event.cancelled(),
                         },
                     );
@@ -1456,7 +1456,7 @@ impl State {
                             slot: event.slot(),
                             location: position.as_logical(),
                             serial,
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                 }
@@ -1505,7 +1505,7 @@ impl State {
                         &TouchMotionEvent {
                             slot: event.slot(),
                             location: position.as_logical(),
-                            time: event.time_msec(),
+                            time: event.time(),
                         },
                     );
                 }
@@ -1531,7 +1531,7 @@ impl State {
                         self,
                         &UpEvent {
                             slot: event.slot(),
-                            time: event.time_msec(),
+                            time: event.time(),
                             serial,
                         },
                     );
@@ -1596,7 +1596,7 @@ impl State {
                         &MotionEvent {
                             location: position.as_logical(),
                             serial: SERIAL_COUNTER.next_serial(),
-                            time: self.common.clock.now().as_millis(),
+                            time: InputTime::from_millis(self.common.clock.now().as_millis()),
                         },
                     );
 
@@ -1627,11 +1627,11 @@ impl State {
                             &tool::MotionEvent {
                                 location: position.as_logical(),
                                 serial: SERIAL_COUNTER.next_serial(),
-                                time: event.time_msec(),
+                                time: event.time(),
                             },
                         );
 
-                        tool.frame(self, event.time_msec());
+                        tool.frame(self, event.time());
                     }
                 }
             }
@@ -1665,7 +1665,7 @@ impl State {
                         &MotionEvent {
                             location: position.as_logical(),
                             serial: SERIAL_COUNTER.next_serial(),
-                            time: self.common.clock.now().as_millis(),
+                            time: InputTime::from_millis(self.common.clock.now().as_millis()),
                         },
                     );
 
@@ -1706,7 +1706,7 @@ impl State {
                                         location: position.as_logical(),
                                         axis: Some(frame),
                                         serial: SERIAL_COUNTER.next_serial(),
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 )
                             }
@@ -1714,12 +1714,12 @@ impl State {
                                 self,
                                 &tool::ProximityOutEvent {
                                     serial,
-                                    time: event.time_msec(),
+                                    time: event.time(),
                                 },
                             ),
                         }
 
-                        tool.frame(self, event.time_msec());
+                        tool.frame(self, event.time());
                     }
                 }
             }
@@ -1742,7 +1742,7 @@ impl State {
                                     self,
                                     &tool::DownEvent {
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                             }
@@ -1751,13 +1751,13 @@ impl State {
                                     self,
                                     &tool::UpEvent {
                                         serial,
-                                        time: event.time_msec(),
+                                        time: event.time(),
                                     },
                                 );
                             }
                         }
 
-                        tool.frame(self, event.time_msec());
+                        tool.frame(self, event.time());
                     }
                 }
             }
@@ -1779,11 +1779,11 @@ impl State {
                                 button: event.button(),
                                 state: event.button_state(),
                                 serial: SERIAL_COUNTER.next_serial(),
-                                time: event.time_msec(),
+                                time: event.time(),
                             },
                         );
 
-                        tool.frame(self, event.time_msec());
+                        tool.frame(self, event.time());
                     }
                 }
             }
@@ -1886,7 +1886,7 @@ impl State {
         let Some(pointer) = seat.get_pointer() else {
             return;
         };
-        let time = self.common.clock.now().as_millis();
+        let time = InputTime::from_millis(self.common.clock.now().as_millis());
         for button in buttons {
             let serial = SERIAL_COUNTER.next_serial();
             pointer.button(
@@ -1948,7 +1948,7 @@ impl State {
         modifiers: &ModifiersState,
         handle: KeysymHandle<'_>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
         keycode: Keycode,
         key_state: KeyState,
         previous_modifiers: ModifiersState,
@@ -2008,7 +2008,7 @@ impl State {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
-        let time = self.common.clock.now().as_millis();
+        let time = InputTime::from_millis(self.common.clock.now().as_millis());
         let previous_modifiers = keyboard.modifier_state();
         let result = keyboard
             .input_from_source(
@@ -2157,7 +2157,7 @@ impl State {
         serial: Serial,
         keycode: Keycode,
         key_state: KeyState,
-        time: u32,
+        time: InputTime,
     ) -> FilterResult<Option<(Action, shortcuts::Binding)>> {
         // Pre-compute for layout-agnostic shortcut matching
         let raw_syms = handle.raw_syms();
@@ -2322,7 +2322,7 @@ impl State {
                                     &backend_id_clone,
                                     &seat_clone,
                                     serial,
-                                    time.overflowing_add(duration as u32).0,
+                                    InputTime::from_millis(time.millis().saturating_add(duration as u32)),
                                     key_pattern_clone.clone(),
                                     None,
                                 );
@@ -2374,7 +2374,7 @@ impl State {
                     self.common.event_loop_handle.insert_idle(move |state| {
                         if let Some(keyboard) = seat.get_keyboard() {
                             let serial = SERIAL_COUNTER.next_serial();
-                            let time = state.common.clock.now().as_millis();
+                            let time = InputTime::from_millis(state.common.clock.now().as_millis());
                             keyboard.input(
                                 state,
                                 key_code,
@@ -2963,7 +2963,7 @@ impl State {
                 &RelativeMotionEvent {
                     delta: (0., 0.).into(),
                     delta_unaccel: (0., 0.).into(),
-                    utime: time.as_micros(),
+                    time: InputTime::from_micros(time.as_micros()),
                 },
             );
             pointer.motion(
@@ -2972,7 +2972,7 @@ impl State {
                 &MotionEvent {
                     location: point.as_logical(),
                     serial,
-                    time: time.as_millis(),
+                    time: InputTime::from_millis(time.as_millis()),
                 },
             );
             pointer.frame(self);

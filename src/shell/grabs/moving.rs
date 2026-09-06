@@ -956,7 +956,7 @@ impl Drop for MoveGrab {
                             &MotionEvent {
                                 location: pointer.current_location(),
                                 serial,
-                                time: state.common.clock.now().as_millis(),
+                                time: InputTime::from_millis(state.common.clock.now().as_millis()),
                             },
                         );
                     }

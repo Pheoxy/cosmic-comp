@@ -14,6 +14,7 @@ use cosmic_config::{ConfigGet, CosmicConfigEntry};
 use cosmic_settings_config::window_rules::ApplicationException;
 use cosmic_settings_config::{Shortcuts, shortcuts, window_rules};
 use serde::{Deserialize, Serialize};
+use smithay::backend::input::InputTime;
 use smithay::utils::{Clock, Monotonic};
 use smithay::wayland::xdg_activation::XdgActivationState;
 pub use smithay::{
@@ -770,7 +771,7 @@ pub fn change_modifier_state(
     const X11_KEYCODE_OFFSET: u32 = 8;
 
     let mut input = |key_state, scan_code| {
-        let time = state.common.clock.now().as_millis();
+        let time = InputTime::from_millis(state.common.clock.now().as_millis());
         let _ = keyboard.input(
             state,
             smithay_input::Keycode::new(scan_code + X11_KEYCODE_OFFSET),

@@ -45,7 +45,7 @@ impl State {
         backend_id: &InputBackendId,
         seat: &Seat<State>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
         pattern: shortcuts::Binding,
         direction: Option<Direction>,
     ) {
@@ -150,7 +150,7 @@ impl State {
         backend_id: &InputBackendId,
         seat: &Seat<State>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
         pattern: shortcuts::Binding,
         direction: Option<Direction>,
         propagate: bool,
