@@ -536,8 +536,8 @@ fn surface_thread(
             renderer::multigpu::vulkan::VulkanGbmBackend,
             vulkan::{Instance, version::Version},
         };
-        let instance =
-            Instance::new(Version::VERSION_1_3, None).context("Failed to create Vulkan instance")?;
+        let instance = Instance::new(Version::VERSION_1_3, None)
+            .context("Failed to create Vulkan instance")?;
         GpuManager::new(VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true))
             .context("Failed to initialize Vulkan rendering api")?
     };
@@ -1141,6 +1141,7 @@ impl SurfaceThreadState {
         };
 
         // actual rendering
+        #[cfg(not(feature = "renderer_vulkan"))]
         let source_output = self
             .mirroring
             .as_ref()
@@ -1153,6 +1154,7 @@ impl SurfaceThreadState {
 
         let mut pre_postprocess_data = PrePostprocessData::default();
 
+        #[cfg(not(feature = "renderer_vulkan"))]
         let res = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
@@ -1342,6 +1344,21 @@ impl SurfaceThreadState {
                     .difference(remove_frame_flags),
             )
         } else {
+            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+                warn!("Unable to set adaptive VRR state: {}", err);
+            }
+            compositor.render_frame(
+                &mut renderer,
+                &elements,
+                CLEAR_COLOR, // TODO use a theme neutral color
+                self.frame_flags
+                    .union(additional_frame_flags)
+                    .difference(remove_frame_flags),
+            )
+        };
+
+        #[cfg(feature = "renderer_vulkan")]
+        let res = {
             if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
                 warn!("Unable to set adaptive VRR state: {}", err);
             }
@@ -1701,6 +1718,37 @@ fn take_screencopy_frames(
         .collect()
 }
 
+#[cfg(feature = "renderer_vulkan")]
+fn send_screencopy_result<'a>(
+    renderer: &mut GlMultiRenderer<'a>,
+    output: &Output,
+    pre_postprocess_data: &mut PrePostprocessData,
+    tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
+    frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<GlMultiRenderer<'a>>>,
+    elements: &[CosmicElement<GlMultiRenderer<'a>>],
+    (session, frame, res): (
+        &ScreencopySessionRef,
+        ScreencopyFrame,
+        Result<(Option<Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>,
+    ),
+    presentation_time: Duration,
+) -> Result<()> {
+    let _ = (
+        renderer,
+        output,
+        pre_postprocess_data,
+        tx,
+        frame_result,
+        elements,
+        session,
+        frame,
+        res,
+        presentation_time,
+    );
+    anyhow::bail!("screencopy is not implemented on renderer_vulkan yet")
+}
+
+#[cfg(not(feature = "renderer_vulkan"))]
 fn send_screencopy_result<'a>(
     renderer: &mut GlMultiRenderer<'a>,
     output: &Output,
@@ -1902,6 +1950,7 @@ fn send_screencopy_result<'a>(
     Ok(())
 }
 
+#[cfg(not(feature = "renderer_vulkan"))]
 fn postprocess_elements<'a>(
     renderer: &mut GlMultiRenderer<'a>,
     output: &Output,

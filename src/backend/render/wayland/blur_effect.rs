@@ -106,12 +106,20 @@ impl BlurShaders {
     }
 
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> Self {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data()
-            .get::<BlurShaders>()
-            .expect("Custom Shaders not initialized")
-            .clone()
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data()
+                .get::<BlurShaders>()
+                .expect("Custom Shaders not initialized")
+                .clone()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            unreachable!("GLES blur shaders are not available with renderer_vulkan")
+        }
     }
 }
 
@@ -218,96 +226,114 @@ impl BlurElement {
         radii: [u8; 4],
         strength: usize,
     ) -> Result<Option<Self>, R::Error> {
-        if strength == 0 || geometry.size.w == 0. || geometry.size.h == 0. {
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = (
+                renderer,
+                state,
+                geometry,
+                region,
+                output_scale,
+                radii,
+                strength,
+            );
             return Ok(None);
         }
 
-        let geo = geometry.to_physical_precise_round(output_scale);
-        let mut extended_geo = geo;
-        let radius = BLUR_PARAMS[(strength + 2).min(MAX_STEPS - 1)].extended_radius as f64;
-        extended_geo.loc -= Point::<f64, Physical>::new(radius, radius);
-        extended_geo.size += Size::<f64, Physical>::new(radius, radius).upscale(2.);
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            if strength == 0 || geometry.size.w == 0. || geometry.size.h == 0. {
+                return Ok(None);
+            }
 
-        // compute input_to_geo so that it crops the extended capture radius
-        let geo_scale = {
-            let Scale { x, y } = geo.size / extended_geo.size;
-            Affine2::from_scale(Vec2::new(x as f32, y as f32)).inverse()
-        };
-        let geo_translation = {
-            let offset = geo.loc - extended_geo.loc;
-            Affine2::from_translation(-Vec2::new(
-                (offset.x / extended_geo.size.w) as f32,
-                (offset.y / extended_geo.size.h) as f32,
-            ))
-        };
-        let input_to_geo = Mat3::from(geo_scale * geo_translation);
+            let geo = geometry.to_physical_precise_round(output_scale);
+            let mut extended_geo = geo;
+            let radius = BLUR_PARAMS[(strength + 2).min(MAX_STEPS - 1)].extended_radius as f64;
+            extended_geo.loc -= Point::<f64, Physical>::new(radius, radius);
+            extended_geo.size += Size::<f64, Physical>::new(radius, radius).upscale(2.);
 
-        let uniforms = vec![
-            Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
-            Uniform::new(
-                "corner_radius",
-                [
-                    radii[0] as f32,
-                    radii[1] as f32,
-                    radii[2] as f32,
-                    radii[3] as f32,
-                ],
-            ),
-            Uniform::new(
-                "input_to_geo",
-                UniformValue::Matrix3x3 {
-                    matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
-                    transpose: false,
-                },
-            ),
-            Uniform::new("noise", UniformValue::_1f(NOISE)),
-        ];
+            // compute input_to_geo so that it crops the extended capture radius
+            let geo_scale = {
+                let Scale { x, y } = geo.size / extended_geo.size;
+                Affine2::from_scale(Vec2::new(x as f32, y as f32)).inverse()
+            };
+            let geo_translation = {
+                let offset = geo.loc - extended_geo.loc;
+                Affine2::from_translation(-Vec2::new(
+                    (offset.x / extended_geo.size.w) as f32,
+                    (offset.y / extended_geo.size.h) as f32,
+                ))
+            };
+            let input_to_geo = Mat3::from(geo_scale * geo_translation);
 
-        let geometry = extended_geo.to_logical(output_scale);
-        let extended_offset = Point::<f64, Physical>::new(radius, radius).to_logical(output_scale);
+            let uniforms = vec![
+                Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
+                Uniform::new(
+                    "corner_radius",
+                    [
+                        radii[0] as f32,
+                        radii[1] as f32,
+                        radii[2] as f32,
+                        radii[3] as f32,
+                    ],
+                ),
+                Uniform::new(
+                    "input_to_geo",
+                    UniformValue::Matrix3x3 {
+                        matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
+                        transpose: false,
+                    },
+                ),
+                Uniform::new("noise", UniformValue::_1f(NOISE)),
+            ];
 
-        let renderer_id = renderer.glow_renderer().context_id();
-        let src = geometry.size.to_buffer(output_scale, Transform::Normal);
-        let params = &BLUR_PARAMS[strength.min(MAX_STEPS - 1)];
+            let geometry = extended_geo.to_logical(output_scale);
+            let extended_offset =
+                Point::<f64, Physical>::new(radius, radius).to_logical(output_scale);
 
-        let dirty = !(state
-            .renderer_id
-            .as_ref()
-            .is_some_and(|id| id == &renderer_id)
-            && state.offset == params.offset
-            && state.passes == params.passes
-            && &state.region == region
-            && state.src == src);
+            let renderer_id = renderer.glow_renderer().context_id();
+            let src = geometry.size.to_buffer(output_scale, Transform::Normal);
+            let params = &BLUR_PARAMS[strength.min(MAX_STEPS - 1)];
 
-        state.renderer_id = Some(renderer_id);
-        state.offset = params.offset;
-        state.passes = params.passes;
-        state.region = region.clone();
-        state.src = src;
-        if dirty {
-            state.commit.increment();
+            let dirty = !(state
+                .renderer_id
+                .as_ref()
+                .is_some_and(|id| id == &renderer_id)
+                && state.offset == params.offset
+                && state.passes == params.passes
+                && &state.region == region
+                && state.src == src);
+
+            state.renderer_id = Some(renderer_id);
+            state.offset = params.offset;
+            state.passes = params.passes;
+            state.region = region.clone();
+            state.src = src;
+            if dirty {
+                state.commit.increment();
+            }
+
+            Ok(Some(BlurElement {
+                id: state.id.clone(),
+                commit: state.commit,
+                src,
+                geometry,
+                extended_offset,
+                scaling_shaders: BlurShaders::get(renderer),
+                render_shader: ClippingShader::get(renderer),
+                offset: state.offset,
+                passes: state.passes,
+                region: region
+                    .iter()
+                    .cloned()
+                    .map(|mut rect| {
+                        rect.loc += extended_offset.to_i32_round();
+                        rect
+                    })
+                    .collect(),
+                uniforms,
+            }))
         }
-
-        Ok(Some(BlurElement {
-            id: state.id.clone(),
-            commit: state.commit,
-            src,
-            geometry,
-            extended_offset,
-            scaling_shaders: BlurShaders::get(renderer),
-            render_shader: ClippingShader::get(renderer),
-            offset: state.offset,
-            passes: state.passes,
-            region: region
-                .iter()
-                .cloned()
-                .map(|mut rect| {
-                    rect.loc += extended_offset.to_i32_round();
-                    rect
-                })
-                .collect(),
-            uniforms,
-        }))
     }
 }
 
@@ -376,58 +402,66 @@ where
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
-        let transform = frame.transformation();
-        let tex_size = self.src.to_i32_round();
-        let glow_frame = <R as AsGlowRenderer>::glow_frame_mut(frame);
-        let gles_frame = BorrowMut::<GlesFrame<'_, '_>>::borrow_mut(glow_frame);
-        let mut renderer = gles_frame.renderer();
-
-        let texture_ref = cache.get_or_insert_threadsafe(BlurTexture::<R::TextureId>::default);
-        let mut texture_entry = texture_ref.lock().unwrap();
-        if texture_entry.as_ref().is_some_and(|tex| {
-            tex.size() != tex_size
-                || R::tex_to_gl(
-                    &renderer.as_ref().context_id(),
-                    texture_entry.as_ref().unwrap(),
-                )
-                .is_none()
-        }) {
-            texture_entry.take();
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = (frame, src, dst, cache);
+            return Ok(());
         }
-        if texture_entry.is_none() {
-            let gl_texture = renderer
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let transform = frame.transformation();
+            let tex_size = self.src.to_i32_round();
+            let glow_frame = <R as AsGlowRenderer>::glow_frame_mut(frame);
+            let gles_frame = BorrowMut::<GlesFrame<'_, '_>>::borrow_mut(glow_frame);
+            let mut renderer = gles_frame.renderer();
+
+            let texture_ref = cache.get_or_insert_threadsafe(BlurTexture::<R::TextureId>::default);
+            let mut texture_entry = texture_ref.lock().unwrap();
+            if texture_entry.as_ref().is_some_and(|tex| {
+                tex.size() != tex_size
+                    || R::tex_to_gl(
+                        &renderer.as_ref().context_id(),
+                        texture_entry.as_ref().unwrap(),
+                    )
+                    .is_none()
+            }) {
+                texture_entry.take();
+            }
+            if texture_entry.is_none() {
+                let gl_texture = renderer
+                    .as_mut()
+                    .create_buffer(Fourcc::Abgr8888, tex_size)
+                    .map_err(R::from_gles_error)?;
+                *texture_entry = Some(R::tex_from_gl(&renderer.as_ref().context_id(), gl_texture));
+            }
+
+            let mut texture = R::tex_to_gl(
+                &renderer.as_ref().context_id(),
+                texture_entry.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut off_texture = renderer
                 .as_mut()
                 .create_buffer(Fourcc::Abgr8888, tex_size)
                 .map_err(R::from_gles_error)?;
-            *texture_entry = Some(R::tex_from_gl(&renderer.as_ref().context_id(), gl_texture));
+            std::mem::drop(renderer);
+
+            let sync = blit_from_active_fb(gles_frame, src, dst, transform, &mut texture)
+                .map_err(R::from_gles_error)?;
+            gles_frame.wait(&sync).map_err(R::from_gles_error)?;
+
+            let mut textures = [&mut texture, &mut off_texture];
+            render_blur(
+                gles_frame.renderer().as_mut(),
+                &self.scaling_shaders,
+                &mut textures,
+                self.offset,
+                self.passes,
+            )
+            .map_err(R::from_gles_error)?;
+
+            Ok(())
         }
-
-        let mut texture = R::tex_to_gl(
-            &renderer.as_ref().context_id(),
-            texture_entry.as_ref().unwrap(),
-        )
-        .unwrap();
-        let mut off_texture = renderer
-            .as_mut()
-            .create_buffer(Fourcc::Abgr8888, tex_size)
-            .map_err(R::from_gles_error)?;
-        std::mem::drop(renderer);
-
-        let sync = blit_from_active_fb(gles_frame, src, dst, transform, &mut texture)
-            .map_err(R::from_gles_error)?;
-        gles_frame.wait(&sync).map_err(R::from_gles_error)?;
-
-        let mut textures = [&mut texture, &mut off_texture];
-        render_blur(
-            gles_frame.renderer().as_mut(),
-            &self.scaling_shaders,
-            &mut textures,
-            self.offset,
-            self.passes,
-        )
-        .map_err(R::from_gles_error)?;
-
-        Ok(())
     }
 
     fn draw(
@@ -456,27 +490,38 @@ where
             .flat_map(|rect| damage.iter().flat_map(move |r| r.intersection(rect)))
             .collect::<Vec<_>>();
         let cache = cache.expect("Framebuffer element without cache?");
-        let Some(texture) = cache.get::<BlurTexture<R::TextureId>>() else {
-            return Err(R::from_gles_error(GlesError::BlitError));
-        };
-        let texture_ref = texture.lock().unwrap();
-
-        if let Some(tex) = texture_ref.as_ref() {
-            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
-            frame.render_texture_from_to(
-                tex,
-                src,
-                dst,
-                &damage,
-                opaque_regions,
-                Transform::Normal,
-                1.0,
-            )?;
-            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .clear_tex_program_override();
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = (frame, src, dst, damage, opaque_regions, cache);
+            return Ok(());
         }
-        Ok(())
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let Some(texture) = cache.get::<BlurTexture<R::TextureId>>() else {
+                return Err(R::from_gles_error(GlesError::BlitError));
+            };
+            let texture_ref = texture.lock().unwrap();
+
+            if let Some(tex) = texture_ref.as_ref() {
+                BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+                    .override_default_tex_program(
+                        self.render_shader.clone(),
+                        self.uniforms.clone(),
+                    );
+                frame.render_texture_from_to(
+                    tex,
+                    src,
+                    dst,
+                    &damage,
+                    opaque_regions,
+                    Transform::Normal,
+                    1.0,
+                )?;
+                BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+                    .clear_tex_program_override();
+            }
+            Ok(())
+        }
     }
 }
 

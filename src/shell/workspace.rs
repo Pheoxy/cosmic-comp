@@ -1819,6 +1819,7 @@ impl Workspace {
                 &mut |elem| push(elem.into()),
             );
 
+            #[cfg(not(feature = "renderer_vulkan"))]
             if let Some(alpha) = alpha {
                 push(
                     Into::<CosmicMappedRenderElement<R>>::into(BackdropShader::element(
@@ -2155,16 +2156,26 @@ where
             WorkspaceRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
-            WorkspaceRenderElement::Backdrop(elem) => RenderElement::<GlowRenderer>::draw(
-                elem,
-                R::glow_frame_mut(frame),
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-            .map_err(R::from_gles_error),
+            WorkspaceRenderElement::Backdrop(elem) => {
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -2179,7 +2190,15 @@ where
             WorkspaceRenderElement::FullscreenPopup(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::Window(elem) => elem.underlying_storage(renderer),
             WorkspaceRenderElement::Backdrop(elem) => {
-                elem.underlying_storage(renderer.glow_renderer_mut())
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    elem.underlying_storage(renderer.glow_renderer_mut())
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, renderer);
+                    None
+                }
             }
         }
     }
@@ -2208,14 +2227,22 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             WorkspaceRenderElement::Backdrop(elem) => {
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, cache);
+                    Ok(())
+                }
             }
         }
     }

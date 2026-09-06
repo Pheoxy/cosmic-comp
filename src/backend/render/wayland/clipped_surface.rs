@@ -24,13 +24,21 @@ pub struct ClippingShader(pub GlesTexProgram);
 
 impl ClippingShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesTexProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data()
-            .get::<ClippingShader>()
-            .expect("Custom Shaders not initialized")
-            .0
-            .clone()
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data()
+                .get::<ClippingShader>()
+                .expect("Custom Shaders not initialized")
+                .0
+                .clone()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            unreachable!("GLES clipping shader is not available with renderer_vulkan")
+        }
     }
 }
 
@@ -259,10 +267,12 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        #[cfg(not(feature = "renderer_vulkan"))]
         BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
             .override_default_tex_program(self.program.clone(), self.uniforms.clone());
         self.inner
             .draw(frame, src, dst, damage, opaque_regions, cache)?;
+        #[cfg(not(feature = "renderer_vulkan"))]
         BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
             .clear_tex_program_override();
         Ok(())

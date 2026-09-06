@@ -106,7 +106,12 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             .with_context(|| "Failed to get renderer for screenshot")
             .and_then(|renderer| match renderer {
                 RendererRef::Glow(renderer) => render_window(renderer, surface),
+                #[cfg(not(feature = "renderer_vulkan"))]
                 RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface),
+                #[cfg(feature = "renderer_vulkan")]
+                RendererRef::GlMulti(_) => {
+                    anyhow::bail!("window screenshot is not implemented on renderer_vulkan yet")
+                }
             });
         if let Err(err) = res {
             warn!(?err, "Failed to take screenshot")
