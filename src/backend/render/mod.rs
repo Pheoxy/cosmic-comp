@@ -96,17 +96,19 @@ use self::element::{AsGlowRenderer, CosmicElement};
 
 use super::kms::Timings;
 
-pub type GlMultiRenderer<'a> =
-    MultiRenderer<'a, 'a, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
+use crate::backend::kms::render::KmsGraphics;
+
+pub type GlMultiRenderer<'a> = MultiRenderer<'a, 'a, KmsGraphics, KmsGraphics>;
 pub type GlMultiFrame<'a, 'frame, 'buffer> =
-    MultiFrame<'a, 'a, 'frame, 'buffer, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
-pub type GlMultiError = MultiError<GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
+    MultiFrame<'a, 'a, 'frame, 'buffer, KmsGraphics, KmsGraphics>;
+pub type GlMultiError = MultiError<KmsGraphics, KmsGraphics>;
 
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
     GlMulti(GlMultiRenderer<'a>),
 }
 
+#[cfg(not(feature = "renderer_vulkan"))]
 impl AsRef<GlowRenderer> for RendererRef<'_> {
     fn as_ref(&self) -> &GlowRenderer {
         match self {
@@ -116,6 +118,7 @@ impl AsRef<GlowRenderer> for RendererRef<'_> {
     }
 }
 
+#[cfg(not(feature = "renderer_vulkan"))]
 impl AsMut<GlowRenderer> for RendererRef<'_> {
     fn as_mut(&mut self) -> &mut GlowRenderer {
         match self {

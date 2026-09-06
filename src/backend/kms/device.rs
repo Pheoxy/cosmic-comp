@@ -2,7 +2,7 @@
 
 use crate::{
     backend::{
-        kms::render::gles::GbmGlowBackend,
+        kms::render::KmsGraphics,
         render::{CLEAR_COLOR, CursorMode, GlMultiRenderer, init_shaders, output_elements},
     },
     config::{CompTransformDef, EdidProduct, ScreenFilter},
@@ -124,6 +124,8 @@ pub struct InnerDevice {
     pub render_node: DrmNode,
     pub is_software: bool,
     pub egl: Option<EGLInternals>,
+    /// True after this node has been added to the session GpuManager.
+    pub renderer_bound: bool,
 
     pub outputs: HashMap<connector::Handle, Output>,
     pub surfaces: HashMap<crtc::Handle, Surface>,
@@ -142,6 +144,7 @@ impl fmt::Debug for InnerDevice {
             .field("render_node", &self.render_node)
             .field("is_software", &self.is_software)
             .field("egl", &self.egl)
+            .field("renderer_bound", &self.renderer_bound)
             .field("outputs", &self.outputs)
             .field("surfaces", &self.surfaces)
             .field("gbm", &"..")
@@ -705,23 +708,56 @@ impl Device {
         let gbm = GbmDevice::new(fd)
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
         let (render_node, render_formats, texture_formats, is_software) = {
-            let egl = init_egl(&gbm)?;
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                let egl = init_egl(&gbm)?;
 
-            let render_node = egl
-                .device
-                .try_get_render_node()
-                .ok()
-                .and_then(std::convert::identity)
-                .unwrap_or(dev_node);
-            let render_formats = egl.context.dmabuf_render_formats().clone();
-            let texture_formats = egl.context.dmabuf_texture_formats().clone();
+                let render_node = egl
+                    .device
+                    .try_get_render_node()
+                    .ok()
+                    .and_then(std::convert::identity)
+                    .unwrap_or(dev_node);
+                let render_formats = egl.context.dmabuf_render_formats().clone();
+                let texture_formats = egl.context.dmabuf_texture_formats().clone();
 
-            (
-                render_node,
-                render_formats,
-                texture_formats,
-                egl.device.is_software(),
-            )
+                (
+                    render_node,
+                    render_formats,
+                    texture_formats,
+                    egl.device.is_software(),
+                )
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            {
+                use smithay::backend::{
+                    allocator::dmabuf::Dmabuf,
+                    renderer::{
+                        Bind,
+                        multigpu::{GpuManager, vulkan::VulkanGbmBackend},
+                        vulkan::VulkanRenderer,
+                    },
+                    vulkan::{Instance, version::Version},
+                };
+                let instance = Instance::new(Version::VERSION_1_3, None)
+                    .context("Failed to create Vulkan instance for format probe")?;
+                let mut backend =
+                    VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true);
+                let preferred = backend
+                    .preferred_node_for_node(dev_node)
+                    .unwrap_or(dev_node);
+                backend.add_node(preferred, gbm.clone());
+                let mut gpus = GpuManager::new(backend)
+                    .context("Failed to probe Vulkan GpuManager")?;
+                let renderer = gpus
+                    .single_renderer(&preferred)
+                    .context("Failed to create Vulkan renderer for format probe")?;
+                let render_formats =
+                    <VulkanRenderer as Bind<Dmabuf>>::supported_formats(renderer.as_ref())
+                        .unwrap_or_default();
+                let texture_formats = renderer.as_ref().wayland_sampled_dmabuf_formats();
+                (preferred, render_formats, texture_formats, false)
+            }
         };
 
         let token = common
@@ -792,6 +828,7 @@ impl Device {
                 render_node,
                 is_software,
                 egl: None,
+                renderer_bound: false,
 
                 outputs: HashMap::new(),
                 surfaces: HashMap::new(),
@@ -1100,39 +1137,48 @@ impl InnerDevice {
     pub fn update_egl(
         &mut self,
         primary_node: Option<&DrmNode>,
-        api: &mut GbmGlowBackend<DrmDeviceFd>,
+        api: &mut KmsGraphics,
     ) -> Result<bool> {
         if self.in_use(primary_node) {
-            if self.egl.is_none() {
-                let egl = init_egl(&self.gbm).context("Failed to create EGL context")?;
-                let mut renderer = unsafe {
-                    GlowRenderer::new(
-                        EGLContext::new_shared_with_priority(
-                            &egl.display,
-                            &egl.context,
-                            ContextPriority::High,
+            if !self.renderer_bound {
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    let egl = init_egl(&self.gbm).context("Failed to create EGL context")?;
+                    let mut renderer = unsafe {
+                        GlowRenderer::new(
+                            EGLContext::new_shared_with_priority(
+                                &egl.display,
+                                &egl.context,
+                                ContextPriority::High,
+                            )
+                            .context("Failed to create shared EGL context")?,
                         )
-                        .context("Failed to create shared EGL context")?,
-                    )
-                    .context("Failed to create GL renderer")?
-                };
-                init_shaders(renderer.borrow_mut()).context("Failed to compile shaders")?;
-                api.add_node(
-                    self.render_node,
-                    GbmAllocator::new(
-                        self.gbm.clone(),
-                        // SCANOUT because stride bugs
-                        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-                    ),
-                    renderer,
-                );
-                self.egl = Some(egl);
+                        .context("Failed to create GL renderer")?
+                    };
+                    init_shaders(renderer.borrow_mut()).context("Failed to compile shaders")?;
+                    api.add_node(
+                        self.render_node,
+                        GbmAllocator::new(
+                            self.gbm.clone(),
+                            // SCANOUT because stride bugs
+                            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                        ),
+                        renderer,
+                    );
+                    self.egl = Some(egl);
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    api.add_node(self.render_node, self.gbm.clone());
+                }
+                self.renderer_bound = true;
             }
             Ok(true)
         } else {
-            if self.egl.is_some() {
+            if self.renderer_bound {
                 let _ = self.egl.take();
                 api.remove_node(&self.render_node);
+                self.renderer_bound = false;
             }
             Ok(false)
         }
@@ -1152,35 +1198,47 @@ impl InnerDevice {
                 surface.remove_node(*gone_device);
             }
             for new_device in used_devices.difference(&known_nodes) {
-                let (render_node, egl, gbm) = if self.render_node == *new_device {
-                    // we need to make sure to do partial borrows here, as device.surfaces is borrowed mutable
-                    (
-                        self.render_node,
-                        self.egl.as_ref().unwrap(),
-                        self.gbm.clone(),
-                    )
+                let (render_node, gbm) = if self.render_node == *new_device {
+                    (self.render_node, self.gbm.clone())
                 } else {
                     let device = others
                         .iter()
                         .find(|d| d.render_node == *new_device)
                         .unwrap();
-                    (
-                        device.render_node,
-                        device.egl.as_ref().unwrap(),
-                        device.gbm.clone(),
-                    )
+                    (device.render_node, device.gbm.clone())
                 };
 
-                surface.add_node(
-                    render_node,
-                    GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
-                    EGLContext::new_shared_with_priority(
-                        &egl.display,
-                        &egl.context,
-                        ContextPriority::High,
-                    )
-                    .context("Failed to create shared EGL context")?,
-                );
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    let egl = if self.render_node == *new_device {
+                        self.egl.as_ref().unwrap()
+                    } else {
+                        others
+                            .iter()
+                            .find(|d| d.render_node == *new_device)
+                            .unwrap()
+                            .egl
+                            .as_ref()
+                            .unwrap()
+                    };
+                    surface.add_node(
+                        render_node,
+                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                        EGLContext::new_shared_with_priority(
+                            &egl.display,
+                            &egl.context,
+                            ContextPriority::High,
+                        )
+                        .context("Failed to create shared EGL context")?,
+                    );
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    surface.add_node(
+                        render_node,
+                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                    );
+                }
             }
         }
 

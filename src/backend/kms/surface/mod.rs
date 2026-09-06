@@ -103,7 +103,7 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::gles::GbmGlowBackend};
+use super::{drm_helpers, render::KmsGraphics};
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -130,7 +130,7 @@ pub struct Surface {
 
 pub struct SurfaceThreadState {
     // rendering
-    api: GpuManager<GbmGlowBackend<DrmDeviceFd>>,
+    api: GpuManager<KmsGraphics>,
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     active: Arc<AtomicBool>,
@@ -205,6 +205,7 @@ pub enum ThreadCommand {
     NodeAdded {
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
+        #[cfg(not(feature = "renderer_vulkan"))]
         egl: EGLContext,
         sync: SyncSender<()>,
     },
@@ -308,14 +309,29 @@ impl Surface {
                             } else {
                                 // If we have freed the node, because it didn't have any active buffers/surfaces,
                                 // we might not be able to evaluate surface feedback yet.
-                                let render_formats =
-                                    kms.api.single_renderer(&source_node).ok()?.dmabuf_formats();
+                                let render_formats = {
+                                    let renderer = kms.api.single_renderer(&source_node).ok()?;
+                                    #[cfg(not(feature = "renderer_vulkan"))]
+                                    {
+                                        renderer.dmabuf_formats()
+                                    }
+                                    #[cfg(feature = "renderer_vulkan")]
+                                    {
+                                        renderer.as_ref().wayland_sampled_dmabuf_formats()
+                                    }
+                                };
                                 // In contrast we must have the target node, if we have an active surface
-                                let target_formats = kms
-                                    .api
-                                    .single_renderer(&target_node)
-                                    .unwrap()
-                                    .dmabuf_formats();
+                                let target_formats = {
+                                    let renderer = kms.api.single_renderer(&target_node).unwrap();
+                                    #[cfg(not(feature = "renderer_vulkan"))]
+                                    {
+                                        renderer.dmabuf_formats()
+                                    }
+                                    #[cfg(feature = "renderer_vulkan")]
+                                    {
+                                        renderer.as_ref().wayland_sampled_dmabuf_formats()
+                                    }
+                                };
                                 let feedback = get_surface_dmabuf_feedback(
                                     source_node,
                                     target_node,
@@ -358,12 +374,18 @@ impl Surface {
         self.active.load(Ordering::SeqCst)
     }
 
-    pub fn add_node(&mut self, node: DrmNode, gbm: GbmAllocator<DrmDeviceFd>, egl: EGLContext) {
+    pub fn add_node(
+        &mut self,
+        node: DrmNode,
+        gbm: GbmAllocator<DrmDeviceFd>,
+        #[cfg(not(feature = "renderer_vulkan"))] egl: EGLContext,
+    ) {
         self.known_nodes.insert(node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::NodeAdded {
             node,
             gbm,
+            #[cfg(not(feature = "renderer_vulkan"))]
             egl,
             sync: tx,
         });
@@ -505,8 +527,20 @@ fn surface_thread(
 
     let mut event_loop = EventLoop::try_new().unwrap();
 
-    let api = GpuManager::new(GbmGlowBackend::<DrmDeviceFd>::default())
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let api = GpuManager::new(super::render::gles::GbmGlowBackend::<DrmDeviceFd>::default())
         .context("Failed to initialize rendering api")?;
+    #[cfg(feature = "renderer_vulkan")]
+    let api = {
+        use smithay::backend::{
+            renderer::multigpu::vulkan::VulkanGbmBackend,
+            vulkan::{Instance, version::Version},
+        };
+        let instance =
+            Instance::new(Version::VERSION_1_3, None).context("Failed to create Vulkan instance")?;
+        GpuManager::new(VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true))
+            .context("Failed to initialize Vulkan rendering api")?
+    };
 
     #[cfg(feature = "debug")]
     let egui = {
@@ -572,10 +606,16 @@ fn surface_thread(
             Event::Msg(ThreadCommand::NodeAdded {
                 node,
                 gbm,
+                #[cfg(not(feature = "renderer_vulkan"))]
                 egl,
                 sync,
             }) => {
+                #[cfg(not(feature = "renderer_vulkan"))]
                 if let Err(err) = state.node_added(node, gbm, egl) {
+                    warn!(?err, ?node, "Failed to add node to surface-thread");
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                if let Err(err) = state.node_added(node, gbm) {
                     warn!(?err, ?node, "Failed to add node to surface-thread");
                 }
                 let _ = sync.send(());
@@ -726,13 +766,19 @@ impl SurfaceThreadState {
         &mut self,
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
-        egl: EGLContext,
+        #[cfg(not(feature = "renderer_vulkan"))] egl: EGLContext,
     ) -> Result<()> {
-        let mut renderer =
-            unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
-        init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
-
-        self.api.as_mut().add_node(node, gbm, renderer);
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let mut renderer =
+                unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
+            init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
+            self.api.as_mut().add_node(node, gbm, renderer);
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            self.api.as_mut().add_node(node, gbm.as_ref().clone());
+        }
 
         Ok(())
     }

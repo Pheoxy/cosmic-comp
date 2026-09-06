@@ -386,88 +386,102 @@ where
 }
 
 pub trait AsGlowRenderer:
-    Renderer
-    + Offscreen<GlesTexture>
-    + Offscreen<GlesRenderbuffer>
-    + ImportAll
-    + ImportMem
-    + ExportMem
-    + Bind<Dmabuf>
-    + Blit
+    Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf>
 {
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer(&self) -> &GlowRenderer;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer_mut(&mut self) -> &mut GlowRenderer;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame<'a, 'frame, 'buffer>(
         frame: &'a Self::Frame<'frame, 'buffer>,
     ) -> &'a GlowFrame<'frame, 'buffer>;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
     ) -> &'a mut GlowFrame<'frame, 'buffer>;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture>;
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn from_gles_error(err: GlesError) -> Self::Error;
 }
 
 impl AsGlowRenderer for GlowRenderer {
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer(&self) -> &GlowRenderer {
         self
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
         self
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame<'a, 'frame, 'buffer>(
         frame: &'a Self::Frame<'frame, 'buffer>,
     ) -> &'a GlowFrame<'frame, 'buffer> {
         frame
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
     ) -> &'a mut GlowFrame<'frame, 'buffer> {
         frame
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_from_gl(_context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
         texture
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_to_gl(
         _context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture> {
         Some(texture.clone())
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn from_gles_error(err: GlesError) -> Self::Error {
         err
     }
 }
 
 impl AsGlowRenderer for GlMultiRenderer<'_> {
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer(&self) -> &GlowRenderer {
         self.as_ref()
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
         self.as_mut()
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame<'b, 'frame, 'buffer>(
         frame: &'b Self::Frame<'frame, 'buffer>,
     ) -> &'b GlowFrame<'frame, 'buffer> {
         frame.as_ref()
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn glow_frame_mut<'b, 'frame, 'buffer>(
         frame: &'b mut Self::Frame<'frame, 'buffer>,
     ) -> &'b mut GlowFrame<'frame, 'buffer> {
         frame.as_mut()
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
         MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap()
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture> {
         texture.get::<GbmGlowBackend<DrmDeviceFd>>(context)
     }
+    #[cfg(not(feature = "renderer_vulkan"))]
     fn from_gles_error(err: GlesError) -> Self::Error {
         GlMultiError::Render(err)
     }
