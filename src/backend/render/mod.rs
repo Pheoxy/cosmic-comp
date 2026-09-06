@@ -200,13 +200,21 @@ type IndicatorCache = RefCell<HashMap<Key, (IndicatorSettings, PixelShaderElemen
 
 impl IndicatorShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data()
-            .get::<IndicatorShader>()
-            .expect("Custom Shaders not initialized")
-            .0
-            .clone()
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data()
+                .get::<IndicatorShader>()
+                .expect("Custom Shaders not initialized")
+                .0
+                .clone()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            unreachable!("GLES indicator shader is not available with renderer_vulkan")
+        }
     }
 
     pub fn focus_element<R: AsGlowRenderer>(
@@ -254,59 +262,76 @@ impl IndicatorShader {
             color,
         };
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data();
-
-        user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
-        let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Static(w) => w.upgrade().is_some(),
-            Key::Group(w) => w.upgrade().is_some(),
-            Key::Window(_, w) => w.alive(),
-        });
-
-        let key = key.into();
-        if cache
-            .get(&key)
-            .filter(|(old_settings, _)| &settings == old_settings)
-            .is_none()
+        #[cfg(feature = "renderer_vulkan")]
         {
-            let thickness: f32 = ((thickness as f64 * scale) / scale) as f32;
-            let shader = Self::get(renderer);
-
-            let elem = PixelShaderElement::new(
-                shader,
-                geo.as_logical(),
-                None, //TODO
+            let _ = (
+                renderer,
+                key,
+                geo,
+                thickness,
+                outer_radius,
                 alpha,
-                vec![
-                    Uniform::new(
-                        "color",
-                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                    ),
-                    Uniform::new("thickness", thickness),
-                    Uniform::new(
-                        "radius",
-                        [
-                            outer_radius[3] as f32,
-                            outer_radius[1] as f32,
-                            outer_radius[0] as f32,
-                            outer_radius[2] as f32,
-                        ],
-                    ),
-                    Uniform::new("scale", scale as f32),
-                ],
-                Kind::Unspecified,
+                scale,
+                color,
+                settings,
             );
-            cache.insert(key.clone(), (settings, elem));
+            unreachable!("GLES indicator shader is not available with renderer_vulkan")
         }
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data();
+            user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
+            let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
+            cache.retain(|k, _| match k {
+                Key::Static(w) => w.upgrade().is_some(),
+                Key::Group(w) => w.upgrade().is_some(),
+                Key::Window(_, w) => w.alive(),
+            });
 
-        let elem = &mut cache.get_mut(&key).unwrap().1;
-        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-            elem.resize(geo.as_logical(), None);
+            let key = key.into();
+            if cache
+                .get(&key)
+                .filter(|(old_settings, _)| &settings == old_settings)
+                .is_none()
+            {
+                let thickness: f32 = ((thickness as f64 * scale) / scale) as f32;
+                let shader = Self::get(renderer);
+
+                let elem = PixelShaderElement::new(
+                    shader,
+                    geo.as_logical(),
+                    None, //TODO
+                    alpha,
+                    vec![
+                        Uniform::new(
+                            "color",
+                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                        ),
+                        Uniform::new("thickness", thickness),
+                        Uniform::new(
+                            "radius",
+                            [
+                                outer_radius[3] as f32,
+                                outer_radius[1] as f32,
+                                outer_radius[0] as f32,
+                                outer_radius[2] as f32,
+                            ],
+                        ),
+                        Uniform::new("scale", scale as f32),
+                    ],
+                    Kind::Unspecified,
+                );
+                cache.insert(key.clone(), (settings, elem));
+            }
+
+            let elem = &mut cache.get_mut(&key).unwrap().1;
+            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+                elem.resize(geo.as_logical(), None);
+            }
+            elem.clone()
         }
-        elem.clone()
     }
 }
 
@@ -322,13 +347,21 @@ type BackdropCache = RefCell<HashMap<Key, (BackdropSettings, PixelShaderElement)
 
 impl BackdropShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data()
-            .get::<BackdropShader>()
-            .expect("Custom Shaders not initialized")
-            .0
-            .clone()
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data()
+                .get::<BackdropShader>()
+                .expect("Custom Shaders not initialized")
+                .0
+                .clone()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            unreachable!("GLES backdrop shader is not available with renderer_vulkan")
+        }
     }
 
     pub fn element<R: AsGlowRenderer>(
@@ -345,48 +378,55 @@ impl BackdropShader {
             color,
         };
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data();
-
-        user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
-        let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Static(w) => w.upgrade().is_some(),
-            Key::Group(a) => a.upgrade().is_some(),
-            Key::Window(_, w) => w.alive(),
-        });
-
-        let key = key.into();
-        if cache
-            .get(&key)
-            .filter(|(old_settings, _)| &settings == old_settings)
-            .is_none()
+        #[cfg(feature = "renderer_vulkan")]
         {
-            let shader = Self::get(renderer);
-
-            let elem = PixelShaderElement::new(
-                shader,
-                geo.as_logical(),
-                None, // TODO
-                alpha,
-                vec![
-                    Uniform::new(
-                        "color",
-                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                    ),
-                    Uniform::new("radius", radius),
-                ],
-                Kind::Unspecified,
-            );
-            cache.insert(key.clone(), (settings, elem));
+            let _ = (renderer, key, geo, radius, alpha, color, settings);
+            unreachable!("GLES backdrop shader is not available with renderer_vulkan")
         }
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data();
+            user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
+            let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
+            cache.retain(|k, _| match k {
+                Key::Static(w) => w.upgrade().is_some(),
+                Key::Group(a) => a.upgrade().is_some(),
+                Key::Window(_, w) => w.alive(),
+            });
 
-        let elem = &mut cache.get_mut(&key).unwrap().1;
-        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-            elem.resize(geo.as_logical(), None);
+            let key = key.into();
+            if cache
+                .get(&key)
+                .filter(|(old_settings, _)| &settings == old_settings)
+                .is_none()
+            {
+                let shader = Self::get(renderer);
+
+                let elem = PixelShaderElement::new(
+                    shader,
+                    geo.as_logical(),
+                    None, // TODO
+                    alpha,
+                    vec![
+                        Uniform::new(
+                            "color",
+                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                        ),
+                        Uniform::new("radius", radius),
+                    ],
+                    Kind::Unspecified,
+                );
+                cache.insert(key.clone(), (settings, elem));
+            }
+
+            let elem = &mut cache.get_mut(&key).unwrap().1;
+            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+                elem.resize(geo.as_logical(), None);
+            }
+            elem.clone()
         }
-        elem.clone()
     }
 }
 
@@ -647,6 +687,7 @@ where
         std::mem::drop(shell_guard);
         let scale = output.current_scale().fractional_scale();
 
+        #[cfg(not(feature = "renderer_vulkan"))]
         if let Some((state, timings)) = _fps {
             vec![
                 fps_ui(
@@ -666,6 +707,11 @@ where
                 .into(),
             ]
         } else {
+            Vec::new()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = (_fps, renderer);
             Vec::new()
         }
     };
@@ -1127,6 +1173,7 @@ pub struct PostprocessState {
 }
 
 impl PostprocessState {
+    #[cfg(not(feature = "renderer_vulkan"))]
     pub fn new_with_renderer<R: AsGlowRenderer>(
         renderer: &mut R,
         format: Fourcc,
@@ -1158,6 +1205,7 @@ impl PostprocessState {
         })
     }
 
+    #[cfg(not(feature = "renderer_vulkan"))]
     pub fn track_cursor<R: AsGlowRenderer>(
         &mut self,
         renderer: &mut R,
@@ -1283,7 +1331,9 @@ where
         ElementFilter::All
     };
 
+    #[cfg(not(feature = "renderer_vulkan"))]
     let mut postprocess_texture = None;
+    #[cfg(not(feature = "renderer_vulkan"))]
     let result = if !screen_filter.filter.is_noop() {
         if screen_filter.state.as_ref().is_none_or(|state| {
             state.output_config != PostprocessOutputConfig::for_output_untransformed(output)
@@ -1427,6 +1477,24 @@ where
         )
     };
 
+    #[cfg(feature = "renderer_vulkan")]
+    let result = render_workspace(
+        gpu,
+        renderer,
+        target,
+        damage_tracker,
+        age,
+        None,
+        shell,
+        zoom_state.as_ref(),
+        now,
+        output,
+        previous_workspace,
+        workspace,
+        cursor_mode,
+        element_filter,
+    );
+
     match result {
         Ok((res, mut elements)) => {
             for (session, frame) in output.take_pending_frames() {
@@ -1478,6 +1546,7 @@ where
 
                         let mut sync = SyncPoint::default();
 
+                        #[cfg(not(feature = "renderer_vulkan"))]
                         if let (Some(damage), _) = &res {
                             // TODO: On Vulkan, may need to combine sync points instead of just using latest?
                             let blit_to_buffer =
@@ -1522,6 +1591,8 @@ where
                                 blit_to_buffer(renderer, target).map_err(RenderError::Rendering)?;
                             }
                         }
+                        #[cfg(feature = "renderer_vulkan")]
+                        let _ = (offscreen, buffer);
 
                         let buffers = render_element_buffers(renderer, &elements);
 

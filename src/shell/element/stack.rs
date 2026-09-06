@@ -733,18 +733,35 @@ impl CosmicStack {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Stack(Arc::downgrade(&self.0.0)));
 
-            Some(
-                CosmicStackRenderElement::Shadow(ShadowShader::element(
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                Some(
+                    CosmicStackRenderElement::Shadow(ShadowShader::element(
+                        renderer,
+                        window_key,
+                        geo.to_i32_round().as_local(),
+                        radii,
+                        if activated { alpha } else { alpha * 0.75 },
+                        output_scale.x,
+                        theme.cosmic().is_dark,
+                    ))
+                    .into(),
+                )
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            {
+                let _ = (
                     renderer,
                     window_key,
-                    geo.to_i32_round().as_local(),
+                    geo,
                     radii,
-                    if activated { alpha } else { alpha * 0.75 },
-                    output_scale.x,
-                    theme.cosmic().is_dark,
-                ))
-                .into(),
-            )
+                    activated,
+                    alpha,
+                    output_scale,
+                    theme,
+                );
+                None
+            }
         })
     }
 
@@ -818,17 +835,20 @@ impl CosmicStack {
                 CosmicMappedKey(CosmicMappedKeyInner::Stack(Arc::downgrade(&self.0.0)));
 
             if !maximized {
-                let (r, g, b, a) = theme.cosmic().bg_divider().into_components();
-                push_above(CosmicStackRenderElement::Border(IndicatorShader::element(
-                    renderer,
-                    Key::Window(Usage::Border, window_key.clone()),
-                    geo.to_i32_round().as_local(),
-                    1,
-                    radii.unwrap_or([0; 4]),
-                    a * alpha,
-                    scale.x,
-                    [r, g, b],
-                )));
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    let (r, g, b, a) = theme.cosmic().bg_divider().into_components();
+                    push_above(CosmicStackRenderElement::Border(IndicatorShader::element(
+                        renderer,
+                        Key::Window(Usage::Border, window_key.clone()),
+                        geo.to_i32_round().as_local(),
+                        1,
+                        radii.unwrap_or([0; 4]),
+                        a * alpha,
+                        scale.x,
+                        [r, g, b],
+                    )));
+                }
             };
 
             let radii = radii.map(|[a, _, c, _]| [a, 0, c, 0]);
@@ -2052,16 +2072,24 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::draw(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
+                    Ok(())
+                }
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -2073,7 +2101,15 @@ where
         match self {
             CosmicStackRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                elem.underlying_storage(renderer.glow_renderer_mut())
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    elem.underlying_storage(renderer.glow_renderer_mut())
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, renderer);
+                    None
+                }
             }
             CosmicStackRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
@@ -2091,14 +2127,22 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicStackRenderElement::Shadow(elem) | CosmicStackRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, cache);
+                    Ok(())
+                }
             }
             CosmicStackRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)

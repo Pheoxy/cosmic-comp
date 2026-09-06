@@ -451,18 +451,35 @@ impl CosmicWindow {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
 
-            Some(
-                CosmicWindowRenderElement::Shadow(ShadowShader::element(
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                Some(
+                    CosmicWindowRenderElement::Shadow(ShadowShader::element(
+                        renderer,
+                        window_key,
+                        geo.to_i32_round().as_local(),
+                        radii,
+                        if activated { alpha } else { alpha * 0.75 },
+                        output_scale.x,
+                        theme.cosmic().is_dark,
+                    ))
+                    .into(),
+                )
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            {
+                let _ = (
                     renderer,
                     window_key,
-                    geo.to_i32_round().as_local(),
+                    geo,
                     radii,
-                    if activated { alpha } else { alpha * 0.75 },
-                    output_scale.x,
-                    theme.cosmic().is_dark,
-                ))
-                .into(),
-            )
+                    activated,
+                    alpha,
+                    output_scale,
+                    theme,
+                );
+                None
+            }
         })
     }
 
@@ -531,21 +548,24 @@ impl CosmicWindow {
         }
 
         if (has_ssd || clip) && !is_maximized {
-            let window_key =
-                CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                let window_key =
+                    CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
 
-            let (r, g, b, a) = bg_divider.into_components();
-            let elem = CosmicWindowRenderElement::Border(IndicatorShader::element(
-                renderer,
-                Key::Window(Usage::Border, window_key.clone()),
-                geo.to_i32_round().as_local(),
-                1,
-                radii,
-                a * alpha,
-                scale.x,
-                [r, g, b],
-            ));
-            push_above(elem);
+                let (r, g, b, a) = bg_divider.into_components();
+                let elem = CosmicWindowRenderElement::Border(IndicatorShader::element(
+                    renderer,
+                    Key::Window(Usage::Border, window_key.clone()),
+                    geo.to_i32_round().as_local(),
+                    1,
+                    radii,
+                    a * alpha,
+                    scale.x,
+                    [r, g, b],
+                ));
+                push_above(elem);
+            }
         }
 
         self.0.with_program(|p| {
@@ -1403,16 +1423,24 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::draw(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    damage,
-                    opaque_regions,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::draw(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        damage,
+                        opaque_regions,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
+                    Ok(())
+                }
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -1424,7 +1452,15 @@ where
         match self {
             CosmicWindowRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                elem.underlying_storage(renderer.glow_renderer_mut())
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    elem.underlying_storage(renderer.glow_renderer_mut())
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, renderer);
+                    None
+                }
             }
             CosmicWindowRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
@@ -1442,14 +1478,22 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                RenderElement::<GlowRenderer>::capture_framebuffer(
-                    elem,
-                    R::glow_frame_mut(frame),
-                    src,
-                    dst,
-                    cache,
-                )
-                .map_err(R::from_gles_error)
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    RenderElement::<GlowRenderer>::capture_framebuffer(
+                        elem,
+                        R::glow_frame_mut(frame),
+                        src,
+                        dst,
+                        cache,
+                    )
+                    .map_err(R::from_gles_error)
+                }
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = (elem, frame, src, dst, cache);
+                    Ok(())
+                }
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)

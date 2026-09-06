@@ -143,6 +143,13 @@ where
     let buffer = frame.buffer();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
 
+    #[cfg(feature = "renderer_vulkan")]
+    if offscreen.is_some() {
+        frame.fail(CaptureFailureReason::Unknown);
+        return Ok(None);
+    }
+
+    #[cfg(not(feature = "renderer_vulkan"))]
     if let Some(fb) = offscreen {
         assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
         if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
@@ -237,30 +244,41 @@ where
 
     let mut age = 1;
     if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
-        let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
-        let format = with_buffer_contents(&buffer, |_, _, data| {
-            shm_format_to_fourcc(data.format)
-                .expect("We should be able to convert all hardcoded shm screencopy formats")
-        })
-        .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            session_user_data.offscreen = None;
+            frame.fail(CaptureFailureReason::Unknown);
+            return Ok(None);
+        }
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
+            let format = with_buffer_contents(&buffer, |_, _, data| {
+                shm_format_to_fourcc(data.format)
+                    .expect("We should be able to convert all hardcoded shm screencopy formats")
+            })
+            .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
 
-        // Re-allocate if context id, size, or format are different
-        session_user_data
-            .offscreen
-            .take_if(|(context_id, renderbuffer)| {
-                renderer.glow_renderer().context_id() != *context_id
-                    || renderbuffer.size() != size
-                    || renderbuffer.format() != Some(format)
-            });
+            // Re-allocate if context id, size, or format are different
+            session_user_data
+                .offscreen
+                .take_if(|(context_id, renderbuffer)| {
+                    renderer.glow_renderer().context_id() != *context_id
+                        || renderbuffer.size() != size
+                        || renderbuffer.format() != Some(format)
+                });
 
-        if session_user_data.offscreen.is_none() {
-            let renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
-                .map_err(DTError::Rendering)?;
-            session_user_data.offscreen =
-                Some((renderer.glow_renderer().context_id(), renderbuffer));
-            // If we're allocating a new offscreen buffer, we need to re-render everything
-            // (or copy the contexts of the shm buffer)
-            age = 0;
+            if session_user_data.offscreen.is_none() {
+                let renderbuffer =
+                    Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
+                        .map_err(DTError::Rendering)?;
+                session_user_data.offscreen =
+                    Some((renderer.glow_renderer().context_id(), renderbuffer));
+                // If we're allocating a new offscreen buffer, we need to re-render everything
+                // (or copy the contexts of the shm buffer)
+                age = 0;
+            }
         }
     } else {
         // If for some reason a capture session is used for shm, but then changes to dmabuf capture,
@@ -269,10 +287,16 @@ where
     }
 
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
+    #[cfg(not(feature = "renderer_vulkan"))]
     let mut fb = offscreen
         .as_mut()
         .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
         .transpose()?;
+    #[cfg(feature = "renderer_vulkan")]
+    let mut fb: Option<R::Framebuffer<'_>> = {
+        let _ = offscreen;
+        None
+    };
     let (result, buffers) = render_fn(
         &frame.buffer(),
         renderer,

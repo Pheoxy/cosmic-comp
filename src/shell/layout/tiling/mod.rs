@@ -4370,7 +4370,13 @@ where
     } as f32
         * transition)
         .round() as i32;
+    #[cfg(not(feature = "renderer_vulkan"))]
     let mut renderer = renderer.into();
+    #[cfg(feature = "renderer_vulkan")]
+    let mut renderer: Option<&mut R> = {
+        let _ = renderer.into();
+        None
+    };
 
     let root = tree.root_node_id();
     let mut stack = Vec::new();
@@ -5079,6 +5085,7 @@ fn render_old_tree_windows<R>(
         |mapped, elem_geometry, geo, alpha, is_minimizing| {
             let radius = mapped.corner_radius(geo.size.as_logical(), indicator_thickness);
             if is_minimizing && indicator_thickness > 0 {
+                #[cfg(not(feature = "renderer_vulkan"))]
                 push(CosmicMappedRenderElement::FocusIndicator(
                     IndicatorShader::focus_element(
                         renderer,
@@ -5344,7 +5351,9 @@ fn render_new_tree_windows<R>(
     let mut window_lower_elements = Vec::new();
     let mut shadow_elements = SmallVec::<[CosmicMappedRenderElement<R>; 4]>::new_const();
 
-    let mut group_backdrop = None;
+    let mut group_backdrop: Option<
+        smithay::backend::renderer::gles::element::PixelShaderElement,
+    > = None;
     let mut indicators = SmallVec::<[CosmicMappedRenderElement<R>; 2]>::new_const();
     let mut resize_elements = SmallVec::<[CosmicMappedRenderElement<R>; 10]>::new_const();
     let mut swap_elements = SmallVec::<[CosmicMappedRenderElement<R>; 4]>::new_const();
@@ -5359,6 +5368,7 @@ fn render_new_tree_windows<R>(
 
     // render placeholder, if we are swapping to an empty workspace
     if target_tree.root_node_id().is_none() && swap_desc.is_some() {
+        #[cfg(not(feature = "renderer_vulkan"))]
         window_upper_elements.push(
             BackdropShader::element(
                 renderer,
@@ -5398,6 +5408,7 @@ fn render_new_tree_windows<R>(
             .radius_s()
             .map(|x| if x < 4.0 { x } else { x + 4.0 })
             .map(|val| (val * scale.x.min(scale.y) as f32).round() as u8);
+        #[cfg(not(feature = "renderer_vulkan"))]
         swap_elements.push(CosmicMappedRenderElement::FocusIndicator(
             IndicatorShader::focus_element(
                 renderer,
@@ -5487,22 +5498,25 @@ fn render_new_tree_windows<R>(
                         geo.loc += (outer_gap, outer_gap).into();
                         geo.size -= (outer_gap * 2, outer_gap * 2).into();
 
-                        let backdrop = BackdropShader::element(
-                            renderer,
-                            match data {
-                                Data::Group { alive, .. } => Key::Group(Arc::downgrade(alive)),
-                                _ => unreachable!(),
-                            },
-                            geo,
-                            radius[0] as f32,
-                            0.4,
-                            group_color,
-                        );
+                        #[cfg(not(feature = "renderer_vulkan"))]
+                        {
+                            let backdrop = BackdropShader::element(
+                                renderer,
+                                match data {
+                                    Data::Group { alive, .. } => Key::Group(Arc::downgrade(alive)),
+                                    _ => unreachable!(),
+                                },
+                                geo,
+                                radius[0] as f32,
+                                0.4,
+                                group_color,
+                            );
 
-                        if focused.as_ref() == Some(&node_id) {
-                            group_backdrop = Some(backdrop);
-                        } else {
-                            indicators.push(backdrop.into());
+                            if focused.as_ref() == Some(&node_id) {
+                                group_backdrop = Some(backdrop);
+                            } else {
+                                indicators.push(backdrop.into());
+                            }
                         }
                     }
                     if !swap_desc
@@ -5511,6 +5525,7 @@ fn render_new_tree_windows<R>(
                         .unwrap_or(false)
                         || focused.as_ref() == Some(&node_id)
                     {
+                        #[cfg(not(feature = "renderer_vulkan"))]
                         indicators.push(CosmicMappedRenderElement::FocusIndicator(
                             IndicatorShader::focus_element(
                                 renderer,
@@ -5711,6 +5726,7 @@ fn render_new_tree_windows<R>(
                 {
                     let mut active_geo = mapped.active_window_geometry().as_local();
                     active_geo.loc += geo.loc - mapped.geometry().loc.as_local();
+                    #[cfg(not(feature = "renderer_vulkan"))]
                     upper_elements.insert(
                         0,
                         CosmicMappedRenderElement::Overlay(BackdropShader::element(

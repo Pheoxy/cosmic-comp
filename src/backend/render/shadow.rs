@@ -32,13 +32,21 @@ type ShadowCache = RefCell<HashMap<CosmicMappedKey, (ShadowParameters, PixelShad
 
 impl ShadowShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data()
-            .get::<ShadowShader>()
-            .expect("Custom Shaders not initialized")
-            .0
-            .clone()
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data()
+                .get::<ShadowShader>()
+                .expect("Custom Shaders not initialized")
+                .0
+                .clone()
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            let _ = renderer;
+            unreachable!("GLES shadow shader is not available with renderer_vulkan")
+        }
     }
 
     pub fn element<R: AsGlowRenderer>(
@@ -66,126 +74,134 @@ impl ShadowShader {
         geo.size.w -= fractional_pixel * 2.;
         geo.size.h -= fractional_pixel * 2.;
 
-        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-            .egl_context()
-            .user_data();
-
-        user_data.insert_if_missing(|| ShadowCache::new(HashMap::new()));
-        let mut cache = user_data.get::<ShadowCache>().unwrap().borrow_mut();
-        cache.retain(|k, _| k.alive());
-
-        if cache
-            .get(&key)
-            .filter(|(old_params, _)| &params == old_params)
-            .is_none()
+        #[cfg(feature = "renderer_vulkan")]
         {
-            let shader = Self::get(renderer);
-
-            let softness = 25.;
-            let spread = 5.;
-            let offset = [0., 5.];
-            let color = [0., 0., 0., if dark_mode { 0.45 } else { 0.35 }];
-            let radius = radius.map(|r| ceil(r as f64));
-            let radius = [
-                radius[3], // top_left
-                radius[1], // top_right
-                radius[0], // bottom_right
-                radius[2], // bottom_left
-            ];
-
-            let width = softness;
-            let sigma = width / 2.;
-            let width = ceil(sigma * 3.);
-
-            let offset = Point::new(ceil(offset[0]), ceil(offset[1]));
-            let spread = ceil(spread.abs()).copysign(spread);
-            let offset = offset - Point::new(spread, spread);
-
-            let box_size = if spread >= 0. {
-                geo.size + Size::new(spread, spread).upscale(2.)
-            } else {
-                geo.size - Size::new(-spread, -spread).upscale(2.)
-            };
-
-            let win_radius = radius;
-            let radius = radius.map(|r| if r > 0. { r.saturating_add(spread) } else { 0. });
-            let shader_size = box_size + Size::from((width, width)).upscale(2.);
-            let mut shader_geo = Rectangle::new(Point::from((-width, -width)), shader_size);
-
-            let window_geo = Rectangle::new(Point::new(0., 0.) - offset - shader_geo.loc, geo.size);
-            let area_size = Vec2::new(shader_geo.size.w as f32, shader_geo.size.h as f32);
-            let geo_loc = Vec2::new(-shader_geo.loc.x as f32, -shader_geo.loc.y as f32);
-            shader_geo.loc += offset + geo.loc;
-
-            let input_to_geo = Mat3::from(
-                Affine2::from_scale(area_size)
-                    * Affine2::from_translation(Vec2::new(
-                        -geo_loc.x / area_size.x,
-                        -geo_loc.y / area_size.y,
-                    )),
-            );
-
-            let window_geo_loc = Vec2::new(window_geo.loc.x as f32, window_geo.loc.y as f32);
-            let window_input_to_geo = Mat3::from(
-                Affine2::from_scale(area_size)
-                    * Affine2::from_translation(Vec2::new(
-                        -window_geo_loc.x / area_size.x,
-                        -window_geo_loc.y / area_size.y,
-                    )),
-            );
-
-            let element = PixelShaderElement::new(
-                shader,
-                shader_geo.to_i32_up().as_logical(),
-                None,
-                alpha,
-                vec![
-                    Uniform::new("shadow_color", color),
-                    Uniform::new("sigma", sigma as f32),
-                    Uniform::new(
-                        "input_to_geo",
-                        UniformValue::Matrix3x3 {
-                            matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
-                            transpose: false,
-                        },
-                    ),
-                    Uniform::new("geo_size", [box_size.w as f32, box_size.h as f32]),
-                    Uniform::new(
-                        "corner_radius",
-                        [
-                            radius[0] as f32,
-                            radius[1] as f32,
-                            radius[2] as f32,
-                            radius[3] as f32,
-                        ],
-                    ),
-                    Uniform::new(
-                        "window_input_to_geo",
-                        UniformValue::Matrix3x3 {
-                            matrices: vec![*AsRef::<[f32; 9]>::as_ref(&window_input_to_geo)],
-                            transpose: false,
-                        },
-                    ),
-                    Uniform::new(
-                        "window_geo_size",
-                        [window_geo.size.w as f32, window_geo.size.h as f32],
-                    ),
-                    Uniform::new(
-                        "window_corner_radius",
-                        [
-                            win_radius[0] as f32,
-                            win_radius[1] as f32,
-                            win_radius[2] as f32,
-                            win_radius[3] as f32,
-                        ],
-                    ),
-                ],
-                Kind::Unspecified,
-            );
-
-            cache.insert(key.clone(), (params, element));
+            let _ = (renderer, key, geo, radius, alpha, scale, dark_mode, params);
+            unreachable!("GLES shadow shader is not available with renderer_vulkan")
         }
+        #[cfg(not(feature = "renderer_vulkan"))]
+        {
+            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+                .egl_context()
+                .user_data();
+            user_data.insert_if_missing(|| ShadowCache::new(HashMap::new()));
+            let mut cache = user_data.get::<ShadowCache>().unwrap().borrow_mut();
+            cache.retain(|k, _| k.alive());
 
-        cache.get(&key).unwrap().1.clone()
+            if cache
+                .get(&key)
+                .filter(|(old_params, _)| &params == old_params)
+                .is_none()
+            {
+                let shader = Self::get(renderer);
+
+                let softness = 25.;
+                let spread = 5.;
+                let offset = [0., 5.];
+                let color = [0., 0., 0., if dark_mode { 0.45 } else { 0.35 }];
+                let radius = radius.map(|r| ceil(r as f64));
+                let radius = [
+                    radius[3], // top_left
+                    radius[1], // top_right
+                    radius[0], // bottom_right
+                    radius[2], // bottom_left
+                ];
+
+                let width = softness;
+                let sigma = width / 2.;
+                let width = ceil(sigma * 3.);
+
+                let offset = Point::new(ceil(offset[0]), ceil(offset[1]));
+                let spread = ceil(spread.abs()).copysign(spread);
+                let offset = offset - Point::new(spread, spread);
+
+                let box_size = if spread >= 0. {
+                    geo.size + Size::new(spread, spread).upscale(2.)
+                } else {
+                    geo.size - Size::new(-spread, -spread).upscale(2.)
+                };
+
+                let win_radius = radius;
+                let radius = radius.map(|r| if r > 0. { r.saturating_add(spread) } else { 0. });
+                let shader_size = box_size + Size::from((width, width)).upscale(2.);
+                let mut shader_geo = Rectangle::new(Point::from((-width, -width)), shader_size);
+
+                let window_geo =
+                    Rectangle::new(Point::new(0., 0.) - offset - shader_geo.loc, geo.size);
+                let area_size = Vec2::new(shader_geo.size.w as f32, shader_geo.size.h as f32);
+                let geo_loc = Vec2::new(-shader_geo.loc.x as f32, -shader_geo.loc.y as f32);
+                shader_geo.loc += offset + geo.loc;
+
+                let input_to_geo = Mat3::from(
+                    Affine2::from_scale(area_size)
+                        * Affine2::from_translation(Vec2::new(
+                            -geo_loc.x / area_size.x,
+                            -geo_loc.y / area_size.y,
+                        )),
+                );
+
+                let window_geo_loc = Vec2::new(window_geo.loc.x as f32, window_geo.loc.y as f32);
+                let window_input_to_geo = Mat3::from(
+                    Affine2::from_scale(area_size)
+                        * Affine2::from_translation(Vec2::new(
+                            -window_geo_loc.x / area_size.x,
+                            -window_geo_loc.y / area_size.y,
+                        )),
+                );
+
+                let element = PixelShaderElement::new(
+                    shader,
+                    shader_geo.to_i32_up().as_logical(),
+                    None,
+                    alpha,
+                    vec![
+                        Uniform::new("shadow_color", color),
+                        Uniform::new("sigma", sigma as f32),
+                        Uniform::new(
+                            "input_to_geo",
+                            UniformValue::Matrix3x3 {
+                                matrices: vec![*AsRef::<[f32; 9]>::as_ref(&input_to_geo)],
+                                transpose: false,
+                            },
+                        ),
+                        Uniform::new("geo_size", [box_size.w as f32, box_size.h as f32]),
+                        Uniform::new(
+                            "corner_radius",
+                            [
+                                radius[0] as f32,
+                                radius[1] as f32,
+                                radius[2] as f32,
+                                radius[3] as f32,
+                            ],
+                        ),
+                        Uniform::new(
+                            "window_input_to_geo",
+                            UniformValue::Matrix3x3 {
+                                matrices: vec![*AsRef::<[f32; 9]>::as_ref(&window_input_to_geo)],
+                                transpose: false,
+                            },
+                        ),
+                        Uniform::new(
+                            "window_geo_size",
+                            [window_geo.size.w as f32, window_geo.size.h as f32],
+                        ),
+                        Uniform::new(
+                            "window_corner_radius",
+                            [
+                                win_radius[0] as f32,
+                                win_radius[1] as f32,
+                                win_radius[2] as f32,
+                                win_radius[3] as f32,
+                            ],
+                        ),
+                    ],
+                    Kind::Unspecified,
+                );
+
+                cache.insert(key.clone(), (params, element));
+            }
+
+            cache.get(&key).unwrap().1.clone()
+        }
     }
 }

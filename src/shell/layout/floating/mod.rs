@@ -1612,21 +1612,24 @@ impl FloatingLayout {
                 }
 
                 if indicator_thickness > 0 {
-                    let element = IndicatorShader::focus_element(
-                        renderer,
-                        Key::Window(Usage::FocusIndicator, elem.key()),
-                        geometry,
-                        indicator_thickness,
-                        radius,
-                        alpha,
-                        output_scale,
-                        [
-                            active_window_hint.red,
-                            active_window_hint.green,
-                            active_window_hint.blue,
-                        ],
-                    );
-                    push(element.into());
+                    #[cfg(not(feature = "renderer_vulkan"))]
+                    {
+                        let element = IndicatorShader::focus_element(
+                            renderer,
+                            Key::Window(Usage::FocusIndicator, elem.key()),
+                            geometry,
+                            indicator_thickness,
+                            radius,
+                            alpha,
+                            output_scale,
+                            [
+                                active_window_hint.red,
+                                active_window_hint.green,
+                                active_window_hint.blue,
+                            ],
+                        );
+                        push(element.into());
+                    }
                 }
             }
 
