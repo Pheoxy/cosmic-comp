@@ -533,6 +533,9 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
 #[cfg(feature = "renderer_vulkan")]
 impl AsGlowRenderer for GlMultiRenderer<'_> {}
 
+#[cfg(feature = "renderer_vulkan")]
+impl AsGlowRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {}
+
 pub struct DamageElement {
     id: Id,
     geometry: Rectangle<i32, Logical>,

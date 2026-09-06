@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#[cfg(feature = "renderer_vulkan")]
+use crate::backend::winit_vulkan::WinitVulkanState;
 use crate::{
     backend::{
         kms::{KmsGuard, KmsState},
@@ -332,6 +334,8 @@ pub struct Common {
 pub enum BackendData {
     X11(X11State),
     Winit(WinitState),
+    #[cfg(feature = "renderer_vulkan")]
+    WinitVulkan(WinitVulkanState),
     Kms(KmsState),
     // TODO
     // Wayland(WaylandState),
@@ -341,6 +345,8 @@ pub enum BackendData {
 pub enum LockedBackend<'a> {
     X11(&'a mut X11State),
     Winit(&'a mut WinitState),
+    #[cfg(feature = "renderer_vulkan")]
+    WinitVulkan(&'a mut WinitVulkanState),
     Kms(KmsGuard<'a>),
 }
 
@@ -385,11 +391,30 @@ impl BackendData {
         }
     }
 
+    #[cfg(feature = "renderer_vulkan")]
+    pub fn winit_vulkan(&mut self) -> &mut WinitVulkanState {
+        match self {
+            BackendData::WinitVulkan(state) => state,
+            _ => unreachable!("Called winit_vulkan in non winit-vulkan backend"),
+        }
+    }
+
+    pub(crate) fn windowed_output(&mut self) -> &Output {
+        match self {
+            BackendData::Winit(state) => &state.output,
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(state) => &state.output,
+            _ => unreachable!("Called windowed_output on a non-windowed backend"),
+        }
+    }
+
     pub fn schedule_render(&mut self, output: &Output) {
         match self {
             BackendData::Winit(_) => {} // We cannot do this on the winit backend.
             // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
             // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(_) => {}
             BackendData::X11(state) => state.schedule_render(output),
             BackendData::Kms(state) => state.schedule_render(output),
             _ => unreachable!("No backend was initialized"),
@@ -408,6 +433,30 @@ impl BackendData {
             }
             BackendData::Winit(state) => {
                 state.backend.renderer().import_dmabuf(&dmabuf, None)?;
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(state) => {
+                anyhow::ensure!(
+                    state
+                        .backend
+                        .renderer()
+                        .sampled_dmabuf_import_supported(&dmabuf),
+                    "sampled dmabuf not supported on Vulkan winit renderer"
+                );
+                if let Some(node) = state
+                    .backend
+                    .renderer()
+                    .physical_device()
+                    .and_then(|device| {
+                        device
+                            .render_node()
+                            .ok()
+                            .flatten()
+                            .or_else(|| device.primary_node().ok().flatten())
+                    })
+                {
+                    dmabuf.set_node(node);
+                }
             }
             BackendData::X11(state) => {
                 state.renderer.import_dmabuf(&dmabuf, None)?;
@@ -444,6 +493,8 @@ impl BackendData {
                 }
             }
             BackendData::Winit(winit) => Ok(RendererRef::Glow(winit.backend.renderer())),
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(_) => Err(GlMultiError::DeviceMissing),
             BackendData::X11(x11) => Ok(RendererRef::Glow(&mut x11.renderer)),
             _ => unreachable!("No backend set when getting offscreen renderer"),
         }
@@ -453,6 +504,8 @@ impl BackendData {
         match self {
             BackendData::Kms(state) => state.update_screen_filter(screen_filter),
             BackendData::Winit(state) => state.update_screen_filter(screen_filter),
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(state) => state.update_screen_filter(screen_filter),
             BackendData::X11(state) => state.update_screen_filter(screen_filter),
             _ => unreachable!("No backend set when setting screen filters"),
         }
@@ -463,6 +516,8 @@ impl BackendData {
             BackendData::Kms(state) => LockedBackend::Kms(state.lock_devices()),
             BackendData::X11(state) => LockedBackend::X11(state),
             BackendData::Winit(state) => LockedBackend::Winit(state),
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(state) => LockedBackend::WinitVulkan(state),
             _ => unreachable!("Tried to lock unset backend"),
         }
     }
@@ -474,6 +529,8 @@ impl LockedBackend<'_> {
             LockedBackend::Kms(state) => state.all_outputs(),
             LockedBackend::X11(state) => state.all_outputs(),
             LockedBackend::Winit(state) => state.all_outputs(),
+            #[cfg(feature = "renderer_vulkan")]
+            LockedBackend::WinitVulkan(state) => state.all_outputs(),
         }
     }
 
@@ -560,6 +617,8 @@ impl LockedBackend<'_> {
                 clock,
             ),
             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
+            #[cfg(feature = "renderer_vulkan")]
+            LockedBackend::WinitVulkan(state) => state.apply_config_for_outputs(test_only),
             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
         }?;
 
@@ -606,6 +665,8 @@ impl LockedBackend<'_> {
                 LockedBackend::Winit(_) => {} // We cannot do this on the winit backend.
                 // Winit has a very strict render-loop and skipping frames breaks atleast the wayland winit-backend.
                 // Swapping with damage (which should be empty on these frames) is likely good enough anyway.
+                #[cfg(feature = "renderer_vulkan")]
+                LockedBackend::WinitVulkan(_) => {}
                 LockedBackend::X11(state) => state.schedule_render(&output),
                 LockedBackend::Kms(state) => state.schedule_render(&output),
             }
