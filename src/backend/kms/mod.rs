@@ -67,72 +67,6 @@ pub use surface::Timings;
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 
-#[cfg(feature = "renderer_vulkan")]
-const INTEL_VULKAN_ICD: &str = "/run/opengl-driver/share/vulkan/icd.d/intel_icd.x86_64.json";
-
-/// Default Vulkan compositor must not load the NVIDIA ICD.
-///
-/// `vkCreateInstance` / `vkEnumeratePhysicalDevices` ioctl `/dev/nvidiactl` while
-/// nvidia-drm is still in `kgspInitRm`. That D-states the greeter (reboot hang).
-/// USB-C/eDP on this machine are Intel. Set `COSMIC_VULKAN_ICD=all` to opt back in
-/// (NVIDIA HDMI scanout). Honors an already-set `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`.
-#[cfg(feature = "renderer_vulkan")]
-fn compositor_enumerates_nvidia() -> bool {
-    matches!(
-        std::env::var("COSMIC_VULKAN_ICD").ok().as_deref(),
-        Some("all") | Some("nvidia")
-    )
-}
-
-#[cfg(feature = "renderer_vulkan")]
-fn apply_compositor_vulkan_icd_filter() {
-    if compositor_enumerates_nvidia() {
-        return;
-    }
-    if std::env::var_os("VK_DRIVER_FILES").is_some()
-        || std::env::var_os("VK_ICD_FILENAMES").is_some()
-    {
-        return;
-    }
-    if !Path::new(INTEL_VULKAN_ICD).is_file() {
-        warn!(
-            icd = INTEL_VULKAN_ICD,
-            "Intel Vulkan ICD missing; not filtering ICDs"
-        );
-        return;
-    }
-    // SAFETY: process-local, before vkCreateInstance. Client/game processes are separate.
-    unsafe {
-        std::env::set_var("VK_DRIVER_FILES", INTEL_VULKAN_ICD);
-    }
-    info!(
-        icd = INTEL_VULKAN_ICD,
-        "restricted compositor Vulkan ICDs to Intel; COSMIC_VULKAN_ICD=all includes NVIDIA"
-    );
-}
-
-#[cfg(feature = "renderer_vulkan")]
-pub(crate) fn skip_nvidia_drm_on_vulkan(path: &Path) -> bool {
-    if compositor_enumerates_nvidia() {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let vendor_path = format!("/sys/class/drm/{name}/device/vendor");
-    let Ok(vendor) = std::fs::read_to_string(&vendor_path) else {
-        return false;
-    };
-    let is_nvidia = u32::from_str_radix(vendor.trim().trim_start_matches("0x"), 16) == Ok(0x10de);
-    if is_nvidia {
-        info!(
-            "Skipping NVIDIA DRM device {} (Intel-only Vulkan compositor; COSMIC_VULKAN_ICD=all to enable)",
-            path.display()
-        );
-    }
-    is_nvidia
-}
-
 #[derive(Debug)]
 pub struct KmsState {
     pub drm_devices: IndexMap<DrmNode, Device>,
@@ -212,7 +146,10 @@ pub fn init_backend(
                     renderer::multigpu::vulkan::VulkanGbmBackend,
                     vulkan::{Instance, version::Version},
                 };
-                apply_compositor_vulkan_icd_filter();
+                // Default loader enumerates every ICD, including NVIDIA. That is required
+                // for HDMI on the dGPU. If RM is still in kgspInitRm, this ioctl can D-state
+                // the compositor; skip the dGPU with COSMIC_DRM_BLOCK_DEVICES=0x10de:0x249d
+                // rather than filtering ICDs (that would also lose NVIDIA scanout).
                 let instance = Instance::new(Version::VERSION_1_3, None)
                     .context("Failed to create Vulkan instance")?;
                 GpuManager::new(

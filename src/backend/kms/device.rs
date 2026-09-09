@@ -199,11 +199,6 @@ impl State {
             return Ok(Vec::new());
         }
 
-        #[cfg(feature = "renderer_vulkan")]
-        if super::skip_nvidia_drm_on_vulkan(path) {
-            return Ok(Vec::new());
-        }
-
         if let Some(allowlist) = dev_list_var("COSMIC_DRM_ALLOW_DEVICES") {
             let mut matched = false;
             if let Ok(node) = DrmNode::from_dev_id(dev) {
@@ -752,8 +747,8 @@ impl Device {
                     .preferred_node_for_node(dev_node)
                     .unwrap_or(dev_node);
                 backend.add_node(preferred, gbm.clone());
-                let mut gpus =
-                    GpuManager::new(backend).context("Failed to probe Vulkan GpuManager")?;
+                let mut gpus = GpuManager::new(backend)
+                    .context("Failed to probe Vulkan GpuManager")?;
                 let renderer = gpus
                     .single_renderer(&preferred)
                     .context("Failed to create Vulkan renderer for format probe")?;
