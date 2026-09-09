@@ -10,7 +10,7 @@ use crate::{
 
 use anyhow::{self, Context, Result};
 use calloop::{
-    LoopSignal,
+    LoopSignal, RegistrationToken,
     timer::{TimeoutAction, Timer},
 };
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputState};
@@ -85,6 +85,8 @@ pub struct KmsState {
 
     pub syncobj_state: Option<DrmSyncobjState>,
     pub dmabuf_global: Option<DmabufGlobal>,
+    pub(crate) syncobj_acquire_source_tokens: HashMap<u64, RegistrationToken>,
+    next_syncobj_acquire_source_id: u64,
 }
 
 pub struct KmsGuard<'a> {
@@ -139,7 +141,8 @@ pub fn init_backend(
         api: {
             #[cfg(not(feature = "renderer_vulkan"))]
             {
-                GpuManager::new(GbmGlowBackend::new()).context("Failed to initialize gpu backend")?
+                GpuManager::new(GbmGlowBackend::new())
+                    .context("Failed to initialize gpu backend")?
             }
             #[cfg(feature = "renderer_vulkan")]
             {
@@ -147,6 +150,10 @@ pub fn init_backend(
                     renderer::multigpu::vulkan::VulkanGbmBackend,
                     vulkan::{Instance, version::Version},
                 };
+                // Default loader enumerates every ICD, including NVIDIA. That is required
+                // for HDMI on the dGPU. If RM is still in kgspInitRm, this ioctl can D-state
+                // the compositor; skip the dGPU with COSMIC_DRM_BLOCK_DEVICES=0x10de:0x249d
+                // rather than filtering ICDs (that would also lose NVIDIA scanout).
                 let instance = Instance::new(Version::VERSION_1_3, None)
                     .context("Failed to create Vulkan instance")?;
                 GpuManager::new(
@@ -161,6 +168,8 @@ pub fn init_backend(
 
         syncobj_state: None,
         dmabuf_global: None,
+        syncobj_acquire_source_tokens: HashMap::new(),
+        next_syncobj_acquire_source_id: 0,
     });
 
     // manually add already present gpus
@@ -491,7 +500,9 @@ impl State {
     }
 
     fn pause_session(&mut self) {
+        let handle = self.common.event_loop_handle.clone();
         let backend = self.backend.kms();
+        backend.clear_syncobj_acquire_sources(&handle);
         backend.libinput.suspend();
         for device in backend.drm_devices.values_mut() {
             if let Some(lease_state) = device.inner.leasing_global.as_mut() {
@@ -669,6 +680,18 @@ impl State {
 impl KmsState {
     pub fn switch_vt(&mut self, num: i32) -> Result<(), anyhow::Error> {
         self.session.change_vt(num).map_err(Into::into)
+    }
+
+    pub(crate) fn next_syncobj_acquire_source_id(&mut self) -> u64 {
+        let id = self.next_syncobj_acquire_source_id;
+        self.next_syncobj_acquire_source_id = self.next_syncobj_acquire_source_id.wrapping_add(1);
+        id
+    }
+
+    fn clear_syncobj_acquire_sources(&mut self, handle: &LoopHandle<'static, State>) {
+        for (_, token) in self.syncobj_acquire_source_tokens.drain() {
+            handle.remove(token);
+        }
     }
 
     pub fn dmabuf_imported(
