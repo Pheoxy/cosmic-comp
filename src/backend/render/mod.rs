@@ -1154,7 +1154,9 @@ impl PostprocessState {
 
         let texture = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
         let texture_buffer = TextureRenderBuffer::from_texture(
-            renderer.glow_renderer(),
+            renderer
+                .glow_renderer()
+                .expect("gles postprocess requires glow"),
             texture,
             1,
             Transform::Normal,
@@ -1201,7 +1203,9 @@ impl PostprocessState {
         let texture = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
 
         let texture_buffer = TextureRenderBuffer::from_texture(
-            renderer.glow_renderer(),
+            renderer
+                .glow_renderer()
+                .expect("gles postprocess requires glow"),
             texture,
             1,
             Transform::Normal,

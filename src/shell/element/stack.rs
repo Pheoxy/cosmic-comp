@@ -818,20 +818,17 @@ impl CosmicStack {
                 CosmicMappedKey(CosmicMappedKeyInner::Stack(Arc::downgrade(&self.0.0)));
 
             if !maximized {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let (r, g, b, a) = theme.cosmic().bg_divider().into_components();
-                    push_above(CosmicStackRenderElement::Border(IndicatorShader::element(
-                        renderer,
-                        Key::Window(Usage::Border, window_key.clone()),
-                        geo.to_i32_round().as_local(),
-                        1,
-                        radii.unwrap_or([0; 4]),
-                        a * alpha,
-                        scale.x,
-                        [r, g, b],
-                    )));
-                }
+                let (r, g, b, a) = theme.cosmic().bg_divider().into_components();
+                push_above(CosmicStackRenderElement::Border(IndicatorShader::element(
+                    renderer,
+                    Key::Window(Usage::Border, window_key.clone()),
+                    geo.to_i32_round().as_local(),
+                    1,
+                    radii.unwrap_or([0; 4]),
+                    a * alpha,
+                    scale.x,
+                    [r, g, b],
+                )));
             };
 
             let radii = radii.map(|[a, _, c, _]| [a, 0, c, 0]);
