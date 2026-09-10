@@ -88,10 +88,12 @@ use smithay::{
 use smithay_egui::EguiState;
 
 pub mod animations;
+pub mod chrome;
 pub mod cursor;
 pub mod element;
 pub mod shadow;
 pub mod wayland;
+pub use self::chrome::CosmicChromeElement;
 use self::element::{AsGlowRenderer, CosmicElement};
 
 use super::kms::Timings;
@@ -134,35 +136,6 @@ pub static RECTANGLE_SHADER: &str = include_str!("./shaders/rounded_rectangle.fr
 pub static POSTPROCESS_SHADER: &str = include_str!("./shaders/offscreen.frag");
 pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
-
-/// GLES rounded-rect pixel shader, or a Vulkan solid fill until those pipelines exist.
-///
-/// Vulkan ignores corner radius. Outline indicators still need a real Vulkan shader and stay
-/// gated.
-#[cfg(not(feature = "renderer_vulkan"))]
-pub type CosmicChromeElement = PixelShaderElement;
-#[cfg(feature = "renderer_vulkan")]
-pub type CosmicChromeElement = smithay::backend::renderer::element::solid::SolidColorRenderElement;
-
-#[cfg(feature = "renderer_vulkan")]
-fn vulkan_solid_chrome(
-    geo: Rectangle<i32, Local>,
-    alpha: f32,
-    color: [f32; 3],
-) -> CosmicChromeElement {
-    let logical = geo.as_logical();
-    let geometry = Rectangle::new(
-        logical.loc.to_physical_precise_round(1f64),
-        logical.size.to_physical_precise_round(1f64),
-    );
-    smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
-        Id::new(),
-        geometry,
-        0,
-        Color32F::new(color[0], color[1], color[2], alpha),
-        Kind::Unspecified,
-    )
-}
 
 pub struct IndicatorShader(pub GlesPixelProgram);
 
@@ -228,22 +201,14 @@ struct IndicatorSettings {
 type IndicatorCache = RefCell<HashMap<Key, (IndicatorSettings, PixelShaderElement)>>;
 
 impl IndicatorShader {
-    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Option<GlesPixelProgram> {
+        renderer.glow_renderer().and_then(|glow| {
+            Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data()
                 .get::<IndicatorShader>()
-                .expect("Custom Shaders not initialized")
-                .0
-                .clone()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            unreachable!("GLES indicator shader is not available with renderer_vulkan")
-        }
+                .map(|shader| shader.0.clone())
+        })
     }
 
     pub fn focus_element<R: AsGlowRenderer>(
@@ -255,7 +220,7 @@ impl IndicatorShader {
         alpha: f32,
         scale: f64,
         active_window_hint: [f32; 3],
-    ) -> PixelShaderElement {
+    ) -> CosmicChromeElement {
         let t = thickness as i32;
         element_geo.loc -= (t, t).into();
         element_geo.size += (t * 2, t * 2).into();
@@ -282,7 +247,13 @@ impl IndicatorShader {
         alpha: f32,
         scale: f64,
         color: [f32; 3],
-    ) -> PixelShaderElement {
+    ) -> CosmicChromeElement {
+        let Some(shader) = Self::get(renderer) else {
+            return CosmicChromeElement::skip();
+        };
+        let glow = renderer
+            .glow_renderer()
+            .expect("indicator shader implies glow");
         let settings = IndicatorSettings {
             thickness,
             outer_radius,
@@ -291,76 +262,57 @@ impl IndicatorShader {
             color,
         };
 
-        #[cfg(feature = "renderer_vulkan")]
+        let user_data = Borrow::<GlesRenderer>::borrow(glow)
+            .egl_context()
+            .user_data();
+        user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
+        let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
+        cache.retain(|k, _| match k {
+            Key::Static(w) => w.upgrade().is_some(),
+            Key::Group(w) => w.upgrade().is_some(),
+            Key::Window(_, w) => w.alive(),
+        });
+
+        let key = key.into();
+        if cache
+            .get(&key)
+            .filter(|(old_settings, _)| &settings == old_settings)
+            .is_none()
         {
-            let _ = (
-                renderer,
-                key,
-                geo,
-                thickness,
-                outer_radius,
+            let thickness: f32 = ((thickness as f64 * scale) / scale) as f32;
+
+            let elem = PixelShaderElement::new(
+                shader,
+                geo.as_logical(),
+                None, //TODO
                 alpha,
-                scale,
-                color,
-                settings,
+                vec![
+                    Uniform::new(
+                        "color",
+                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                    ),
+                    Uniform::new("thickness", thickness),
+                    Uniform::new(
+                        "radius",
+                        [
+                            outer_radius[0] as f32,
+                            outer_radius[1] as f32,
+                            outer_radius[2] as f32,
+                            outer_radius[3] as f32,
+                        ],
+                    ),
+                    Uniform::new("scale", scale as f32),
+                ],
+                Kind::Unspecified,
             );
-            unreachable!("GLES indicator shader is not available with renderer_vulkan")
+            cache.insert(key.clone(), (settings, elem));
         }
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-                .egl_context()
-                .user_data();
-            user_data.insert_if_missing(|| IndicatorCache::new(HashMap::new()));
-            let mut cache = user_data.get::<IndicatorCache>().unwrap().borrow_mut();
-            cache.retain(|k, _| match k {
-                Key::Static(w) => w.upgrade().is_some(),
-                Key::Group(w) => w.upgrade().is_some(),
-                Key::Window(_, w) => w.alive(),
-            });
 
-            let key = key.into();
-            if cache
-                .get(&key)
-                .filter(|(old_settings, _)| &settings == old_settings)
-                .is_none()
-            {
-                let thickness: f32 = ((thickness as f64 * scale) / scale) as f32;
-                let shader = Self::get(renderer);
-
-                let elem = PixelShaderElement::new(
-                    shader,
-                    geo.as_logical(),
-                    None, //TODO
-                    alpha,
-                    vec![
-                        Uniform::new(
-                            "color",
-                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                        ),
-                        Uniform::new("thickness", thickness),
-                        Uniform::new(
-                            "radius",
-                            [
-                                outer_radius[0] as f32,
-                                outer_radius[1] as f32,
-                                outer_radius[2] as f32,
-                                outer_radius[3] as f32,
-                            ],
-                        ),
-                        Uniform::new("scale", scale as f32),
-                    ],
-                    Kind::Unspecified,
-                );
-                cache.insert(key.clone(), (settings, elem));
-            }
-
-            let elem = &mut cache.get_mut(&key).unwrap().1;
-            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-                elem.resize(geo.as_logical(), None);
-            }
-            elem.clone()
+        let elem = &mut cache.get_mut(&key).unwrap().1;
+        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+            elem.resize(geo.as_logical(), None);
         }
+        CosmicChromeElement::shader(elem.clone())
     }
 }
 
@@ -375,22 +327,14 @@ struct BackdropSettings {
 type BackdropCache = RefCell<HashMap<Key, (BackdropSettings, PixelShaderElement)>>;
 
 impl BackdropShader {
-    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Option<GlesPixelProgram> {
+        renderer.glow_renderer().and_then(|glow| {
+            Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data()
                 .get::<BackdropShader>()
-                .expect("Custom Shaders not initialized")
-                .0
-                .clone()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            unreachable!("GLES backdrop shader is not available with renderer_vulkan")
-        }
+                .map(|shader| shader.0.clone())
+        })
     }
 
     pub fn element<R: AsGlowRenderer>(
@@ -401,61 +345,57 @@ impl BackdropShader {
         alpha: f32,
         color: [f32; 3],
     ) -> CosmicChromeElement {
+        let Some(shader) = Self::get(renderer) else {
+            return CosmicChromeElement::fill(geo, alpha, color);
+        };
+        let glow = renderer
+            .glow_renderer()
+            .expect("backdrop shader implies glow");
         let settings = BackdropSettings {
             radius,
             alpha,
             color,
         };
 
-        #[cfg(feature = "renderer_vulkan")]
+        let user_data = Borrow::<GlesRenderer>::borrow(glow)
+            .egl_context()
+            .user_data();
+        user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
+        let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
+        cache.retain(|k, _| match k {
+            Key::Static(w) => w.upgrade().is_some(),
+            Key::Group(a) => a.upgrade().is_some(),
+            Key::Window(_, w) => w.alive(),
+        });
+
+        let key = key.into();
+        if cache
+            .get(&key)
+            .filter(|(old_settings, _)| &settings == old_settings)
+            .is_none()
         {
-            let _ = (renderer, key, radius, settings);
-            vulkan_solid_chrome(geo, alpha, color)
+            let elem = PixelShaderElement::new(
+                shader,
+                geo.as_logical(),
+                None, // TODO
+                alpha,
+                vec![
+                    Uniform::new(
+                        "color",
+                        [color[0] * alpha, color[1] * alpha, color[2] * alpha],
+                    ),
+                    Uniform::new("radius", radius),
+                ],
+                Kind::Unspecified,
+            );
+            cache.insert(key.clone(), (settings, elem));
         }
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
-                .egl_context()
-                .user_data();
-            user_data.insert_if_missing(|| BackdropCache::new(HashMap::new()));
-            let mut cache = user_data.get::<BackdropCache>().unwrap().borrow_mut();
-            cache.retain(|k, _| match k {
-                Key::Static(w) => w.upgrade().is_some(),
-                Key::Group(a) => a.upgrade().is_some(),
-                Key::Window(_, w) => w.alive(),
-            });
 
-            let key = key.into();
-            if cache
-                .get(&key)
-                .filter(|(old_settings, _)| &settings == old_settings)
-                .is_none()
-            {
-                let shader = Self::get(renderer);
-
-                let elem = PixelShaderElement::new(
-                    shader,
-                    geo.as_logical(),
-                    None, // TODO
-                    alpha,
-                    vec![
-                        Uniform::new(
-                            "color",
-                            [color[0] * alpha, color[1] * alpha, color[2] * alpha],
-                        ),
-                        Uniform::new("radius", radius),
-                    ],
-                    Kind::Unspecified,
-                );
-                cache.insert(key.clone(), (settings, elem));
-            }
-
-            let elem = &mut cache.get_mut(&key).unwrap().1;
-            if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
-                elem.resize(geo.as_logical(), None);
-            }
-            elem.clone()
+        let elem = &mut cache.get_mut(&key).unwrap().1;
+        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+            elem.resize(geo.as_logical(), None);
         }
+        CosmicChromeElement::shader(elem.clone())
     }
 }
 

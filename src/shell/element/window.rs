@@ -1436,8 +1436,8 @@ impl WaylandFocus for CosmicWindow {
 
 pub enum CosmicWindowRenderElement<R: AsGlowRenderer + ImportAll + ImportMem> {
     Header(IcedRenderElement<R>),
-    Shadow(PixelShaderElement),
-    Border(PixelShaderElement),
+    Shadow(crate::backend::render::CosmicChromeElement),
+    Border(crate::backend::render::CosmicChromeElement),
     Window(SurfaceRenderElement<R>),
 }
 
@@ -1585,24 +1585,7 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        R::glow_frame_mut(frame),
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
-                }
+                RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -1614,15 +1597,7 @@ where
         match self {
             CosmicWindowRenderElement::Header(elem) => elem.underlying_storage(renderer),
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    elem.underlying_storage(renderer.glow_renderer_mut())
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
+                elem.underlying_storage(renderer)
             }
             CosmicWindowRenderElement::Window(elem) => elem.underlying_storage(renderer),
         }
@@ -1640,22 +1615,7 @@ where
                 elem.capture_framebuffer(frame, src, dst, cache)
             }
             CosmicWindowRenderElement::Shadow(elem) | CosmicWindowRenderElement::Border(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem,
-                        R::glow_frame_mut(frame),
-                        src,
-                        dst,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, cache);
-                    Ok(())
-                }
+                RenderElement::<R>::capture_framebuffer(elem, frame, src, dst, cache)
             }
             CosmicWindowRenderElement::Window(elem) => {
                 elem.capture_framebuffer(frame, src, dst, cache)
