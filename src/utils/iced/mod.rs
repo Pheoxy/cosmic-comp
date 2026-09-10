@@ -1222,7 +1222,6 @@ impl<P: Program + Send + 'static> IcedElement<P> {
                     *radius = ((*radius as f64) * internal_ref.additional_scale).round() as u8;
                 }
 
-                #[cfg(not(feature = "renderer_vulkan"))]
                 match BlurElement::from_state(
                     renderer,
                     &mut internal_ref.blur,

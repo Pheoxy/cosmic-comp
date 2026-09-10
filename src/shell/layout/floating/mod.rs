@@ -1612,7 +1612,6 @@ impl FloatingLayout {
                 }
 
                 if indicator_thickness > 0 {
-                    #[cfg(not(feature = "renderer_vulkan"))]
                     {
                         let element = IndicatorShader::focus_element(
                             renderer,

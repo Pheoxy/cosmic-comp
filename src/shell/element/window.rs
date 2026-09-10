@@ -540,24 +540,21 @@ impl CosmicWindow {
         }
 
         if (has_ssd || clip) && !is_maximized {
-            #[cfg(not(feature = "renderer_vulkan"))]
-            {
-                let window_key =
-                    CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
+            let window_key =
+                CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
 
-                let (r, g, b, a) = bg_divider.into_components();
-                let elem = CosmicWindowRenderElement::Border(IndicatorShader::element(
-                    renderer,
-                    Key::Window(Usage::Border, window_key.clone()),
-                    geo.to_i32_round().as_local(),
-                    1,
-                    radii,
-                    a * alpha,
-                    scale.x,
-                    [r, g, b],
-                ));
-                push_above(elem);
-            }
+            let (r, g, b, a) = bg_divider.into_components();
+            let elem = CosmicWindowRenderElement::Border(IndicatorShader::element(
+                renderer,
+                Key::Window(Usage::Border, window_key.clone()),
+                geo.to_i32_round().as_local(),
+                1,
+                radii,
+                a * alpha,
+                scale.x,
+                [r, g, b],
+            ));
+            push_above(elem);
         }
 
         self.0.with_program(|p| {
