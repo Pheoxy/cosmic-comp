@@ -733,35 +733,18 @@ impl CosmicStack {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Stack(Arc::downgrade(&self.0.0)));
 
-            #[cfg(not(feature = "renderer_vulkan"))]
-            {
-                Some(
-                    CosmicStackRenderElement::Shadow(ShadowShader::element(
-                        renderer,
-                        window_key,
-                        geo.to_i32_round().as_local(),
-                        radii,
-                        if activated { alpha } else { alpha * 0.75 },
-                        output_scale.x,
-                        theme.cosmic().is_dark,
-                    ))
-                    .into(),
-                )
-            }
-            #[cfg(feature = "renderer_vulkan")]
-            {
-                let _ = (
+            Some(
+                CosmicStackRenderElement::Shadow(ShadowShader::element(
                     renderer,
                     window_key,
-                    geo,
+                    geo.to_i32_round().as_local(),
                     radii,
-                    activated,
-                    alpha,
-                    output_scale,
-                    theme,
-                );
-                None
-            }
+                    if activated { alpha } else { alpha * 0.75 },
+                    output_scale.x,
+                    theme.cosmic().is_dark,
+                ))
+                .into(),
+            )
         })
     }
 

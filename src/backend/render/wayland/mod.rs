@@ -90,39 +90,26 @@ pub fn push_render_elements_from_surface_tree<R>(
                     ) {
                         Ok(Some(surface)) => {
                             let blur_geo = blur_geometry.unwrap_or(geometry);
-                            #[cfg(not(feature = "renderer_vulkan"))]
-                            {
-                                blur = BlurElement::from_surface(
-                                    renderer,
-                                    states,
-                                    blur_geo,
-                                    scale.x,
-                                    radii,
-                                    blur_strength,
-                                );
-                            }
-                            #[cfg(feature = "renderer_vulkan")]
-                            let _ = (blur_geo, blur_strength);
+                            blur = BlurElement::from_surface(
+                                renderer,
+                                states,
+                                blur_geo,
+                                scale.x,
+                                radii,
+                                blur_strength,
+                            );
                             let elem: SurfaceRenderElement<R> = {
-                                #[cfg(not(feature = "renderer_vulkan"))]
+                                if radii.iter().any(|r| *r != 0)
+                                    && should_clip
+                                    && ClippedSurfaceRenderElement::will_clip(
+                                        &surface, scale, geometry, radii,
+                                    )
                                 {
-                                    if radii.iter().any(|r| *r != 0)
-                                        && should_clip
-                                        && ClippedSurfaceRenderElement::will_clip(
-                                            &surface, scale, geometry, radii,
-                                        )
-                                    {
-                                        ClippedSurfaceRenderElement::new(
-                                            renderer, surface, scale, geometry, radii,
-                                        )
-                                        .into()
-                                    } else {
-                                        surface.into()
-                                    }
-                                }
-                                #[cfg(feature = "renderer_vulkan")]
-                                {
-                                    let _ = (should_clip, radii);
+                                    ClippedSurfaceRenderElement::new(
+                                        renderer, surface, scale, geometry, radii,
+                                    )
+                                    .into()
+                                } else {
                                     surface.into()
                                 }
                             };

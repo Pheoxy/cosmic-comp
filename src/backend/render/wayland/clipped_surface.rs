@@ -23,29 +23,21 @@ pub static CLIPPING_SHADER: &str = include_str!("../shaders/clipped_surface.frag
 pub struct ClippingShader(pub GlesTexProgram);
 
 impl ClippingShader {
-    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesTexProgram {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Option<GlesTexProgram> {
+        renderer.glow_renderer().and_then(|glow| {
+            Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data()
                 .get::<ClippingShader>()
-                .expect("Custom Shaders not initialized")
-                .0
-                .clone()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            unreachable!("GLES clipping shader is not available with renderer_vulkan")
-        }
+                .map(|shader| shader.0.clone())
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    program: Option<GlesTexProgram>,
     radius: [u8; 4],
     geometry: Rectangle<f64, Logical>,
     uniforms: Vec<Uniform<'static>>,
@@ -267,14 +259,16 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .override_default_tex_program(self.program.clone(), self.uniforms.clone());
+        if let (Some(program), Some(glow_frame)) = (self.program.as_ref(), R::glow_frame_mut(frame))
+        {
+            BorrowMut::<GlesFrame>::borrow_mut(glow_frame)
+                .override_default_tex_program(program.clone(), self.uniforms.clone());
+        }
         self.inner
             .draw(frame, src, dst, damage, opaque_regions, cache)?;
-        #[cfg(not(feature = "renderer_vulkan"))]
-        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .clear_tex_program_override();
+        if let Some(glow_frame) = R::glow_frame_mut(frame) {
+            BorrowMut::<GlesFrame>::borrow_mut(glow_frame).clear_tex_program_override();
+        }
         Ok(())
     }
 

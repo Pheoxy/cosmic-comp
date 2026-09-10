@@ -1436,43 +1436,13 @@ where
             CosmicMappedRenderElement::Window(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::TiledStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::TiledWindow(elem) => elem.underlying_storage(renderer),
-            CosmicMappedRenderElement::TiledOverlay(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    elem.underlying_storage(renderer.glow_renderer_mut())
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
-            }
+            CosmicMappedRenderElement::TiledOverlay(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::MovingStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::MovingWindow(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::GrabbedStack(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::GrabbedWindow(elem) => elem.underlying_storage(renderer),
-            CosmicMappedRenderElement::FocusIndicator(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    elem.underlying_storage(renderer.glow_renderer_mut())
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
-            }
-            CosmicMappedRenderElement::Overlay(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    elem.underlying_storage(renderer.glow_renderer_mut())
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
-            }
+            CosmicMappedRenderElement::FocusIndicator(elem) => elem.underlying_storage(renderer),
+            CosmicMappedRenderElement::Overlay(elem) => elem.underlying_storage(renderer),
             CosmicMappedRenderElement::StackHoverIndicator(elem) => {
                 elem.underlying_storage(renderer)
             }
