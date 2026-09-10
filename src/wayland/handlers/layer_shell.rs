@@ -55,6 +55,9 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        self.backend
+            .retire_surface_tree_textures(surface.wl_surface());
+
         let mut shell = self.common.shell.write();
         let maybe_output = shell
             .outputs()
