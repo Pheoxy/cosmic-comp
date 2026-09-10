@@ -106,11 +106,20 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             .with_context(|| "Failed to get renderer for screenshot")
             .and_then(|renderer| match renderer {
                 RendererRef::Glow(renderer) => render_window(renderer, surface),
-                #[cfg(not(feature = "renderer_vulkan"))]
-                RendererRef::GlMulti(mut renderer) => render_window(&mut renderer, surface),
-                #[cfg(feature = "renderer_vulkan")]
-                RendererRef::GlMulti(_) => {
-                    anyhow::bail!("window screenshot is not implemented on renderer_vulkan yet")
+                RendererRef::GlMulti(mut renderer) => {
+                    if renderer.glow_renderer().is_some() {
+                        #[cfg(not(feature = "renderer_vulkan"))]
+                        {
+                            render_window(&mut renderer, surface)
+                        }
+                        #[cfg(feature = "renderer_vulkan")]
+                        {
+                            let _ = renderer;
+                            anyhow::bail!("window screenshot needs a GLES offscreen target")
+                        }
+                    } else {
+                        anyhow::bail!("window screenshot needs a GLES offscreen target")
+                    }
                 }
             });
         if let Err(err) = res {

@@ -402,15 +402,10 @@ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<
                 .or(*kms.primary_node.read().unwrap())
         })
         .unwrap();
-    #[cfg(not(feature = "renderer_vulkan"))]
-    {
-        Some(constraints_for_renderer(mode, renderer.as_mut()))
-    }
-    #[cfg(feature = "renderer_vulkan")]
-    {
-        let _ = renderer;
-        Some(constraints_shm_only(mode))
-    }
+    Some(match renderer.glow_renderer() {
+        Some(glow) => constraints_for_renderer(mode, glow),
+        None => constraints_shm_only(mode),
+    })
 }
 
 fn constraints_for_toplevel(
@@ -433,18 +428,12 @@ fn constraints_for_toplevel(
         })
         .unwrap();
 
-    #[cfg(not(feature = "renderer_vulkan"))]
-    {
-        Some(constraints_for_renderer(size, renderer.as_mut()))
-    }
-    #[cfg(feature = "renderer_vulkan")]
-    {
-        let _ = renderer;
-        Some(constraints_shm_only(size))
-    }
+    Some(match renderer.glow_renderer() {
+        Some(glow) => constraints_for_renderer(size, glow),
+        None => constraints_shm_only(size),
+    })
 }
 
-#[cfg(feature = "renderer_vulkan")]
 fn constraints_shm_only(size: Size<i32, BufferCoords>) -> BufferConstraints {
     BufferConstraints {
         size,
@@ -453,7 +442,6 @@ fn constraints_shm_only(size: Size<i32, BufferCoords>) -> BufferConstraints {
     }
 }
 
-#[cfg(not(feature = "renderer_vulkan"))]
 fn constraints_for_renderer(
     size: Size<i32, BufferCoords>,
     renderer: &mut GlowRenderer,
