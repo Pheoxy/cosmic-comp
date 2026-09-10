@@ -1,5 +1,5 @@
 use crate::{
-    backend::render::element::AsGlowRenderer,
+    backend::render::{CosmicChromeElement, element::AsGlowRenderer},
     state::State,
     utils::{
         iced::{IcedElementInternal, IcedRenderElement},
@@ -18,7 +18,6 @@ use smithay::{
                 Element, Kind, RenderElement, UnderlyingStorage,
                 utils::{CropRenderElement, RelocateRenderElement, RescaleRenderElement},
             },
-            gles::element::PixelShaderElement,
             glow::GlowRenderer,
             utils::{DamageSet, OpaqueRegions},
         },
@@ -1117,7 +1116,7 @@ where
         >,
     ),
     TiledOverlay(
-        CropRenderElement<RelocateRenderElement<RescaleRenderElement<PixelShaderElement>>>,
+        CropRenderElement<RelocateRenderElement<RescaleRenderElement<CosmicChromeElement>>>,
     ),
     MovingStack(
         RelocateRenderElement<RescaleRenderElement<self::stack::CosmicStackRenderElement<R>>>,
@@ -1127,8 +1126,8 @@ where
     ),
     GrabbedStack(RescaleRenderElement<self::stack::CosmicStackRenderElement<R>>),
     GrabbedWindow(RescaleRenderElement<self::window::CosmicWindowRenderElement<R>>),
-    FocusIndicator(PixelShaderElement),
-    Overlay(PixelShaderElement),
+    FocusIndicator(CosmicChromeElement),
+    Overlay(CosmicChromeElement),
     StackHoverIndicator(IcedRenderElement<R>),
     #[cfg(feature = "debug")]
     Egui(TextureRenderElement<GlesTexture>),
@@ -1398,8 +1397,7 @@ where
                 }
                 #[cfg(feature = "renderer_vulkan")]
                 {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
+                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
                 }
             }
             CosmicMappedRenderElement::MovingStack(elem) => {
@@ -1430,8 +1428,7 @@ where
                 }
                 #[cfg(feature = "renderer_vulkan")]
                 {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
+                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
                 }
             }
             CosmicMappedRenderElement::Overlay(elem) => {
@@ -1450,8 +1447,7 @@ where
                 }
                 #[cfg(feature = "renderer_vulkan")]
                 {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
+                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
                 }
             }
             CosmicMappedRenderElement::StackHoverIndicator(elem) => {
@@ -1674,13 +1670,13 @@ where
     }
 }
 
-impl<R> From<PixelShaderElement> for CosmicMappedRenderElement<R>
+impl<R> From<CosmicChromeElement> for CosmicMappedRenderElement<R>
 where
     R: AsGlowRenderer,
     R::TextureId: 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
-    fn from(elem: PixelShaderElement) -> Self {
+    fn from(elem: CosmicChromeElement) -> Self {
         CosmicMappedRenderElement::FocusIndicator(elem)
     }
 }

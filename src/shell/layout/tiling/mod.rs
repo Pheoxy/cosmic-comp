@@ -4370,13 +4370,7 @@ where
     } as f32
         * transition)
         .round() as i32;
-    #[cfg(not(feature = "renderer_vulkan"))]
     let mut renderer = renderer.into();
-    #[cfg(feature = "renderer_vulkan")]
-    let mut renderer: Option<&mut R> = {
-        let _ = renderer.into();
-        None
-    };
 
     let root = tree.root_node_id();
     let mut stack = Vec::new();
@@ -4550,6 +4544,7 @@ where
                     if let Some(renderer) = renderer.as_mut() {
                         if (render_potential_group || render_active_child) && Some(&node_id) != root
                         {
+                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -4568,6 +4563,7 @@ where
                             && pill_indicator.is_some()
                             && Some(&node_id) != root
                         {
+                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -4632,6 +4628,7 @@ where
                             };
 
                             if draw_outline {
+                                #[cfg(not(feature = "renderer_vulkan"))]
                                 push(
                                     IndicatorShader::element(
                                         *renderer,
@@ -4869,6 +4866,7 @@ where
 
                     if let Some(renderer) = renderer.as_mut() {
                         if render_potential_group {
+                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -5351,9 +5349,7 @@ fn render_new_tree_windows<R>(
     let mut window_lower_elements = Vec::new();
     let mut shadow_elements = SmallVec::<[CosmicMappedRenderElement<R>; 4]>::new_const();
 
-    let mut group_backdrop: Option<
-        smithay::backend::renderer::gles::element::PixelShaderElement,
-    > = None;
+    let mut group_backdrop: Option<crate::backend::render::CosmicChromeElement> = None;
     let mut indicators = SmallVec::<[CosmicMappedRenderElement<R>; 2]>::new_const();
     let mut resize_elements = SmallVec::<[CosmicMappedRenderElement<R>; 10]>::new_const();
     let mut swap_elements = SmallVec::<[CosmicMappedRenderElement<R>; 4]>::new_const();
@@ -5368,7 +5364,6 @@ fn render_new_tree_windows<R>(
 
     // render placeholder, if we are swapping to an empty workspace
     if target_tree.root_node_id().is_none() && swap_desc.is_some() {
-        #[cfg(not(feature = "renderer_vulkan"))]
         window_upper_elements.push(
             BackdropShader::element(
                 renderer,
@@ -5498,7 +5493,6 @@ fn render_new_tree_windows<R>(
                         geo.loc += (outer_gap, outer_gap).into();
                         geo.size -= (outer_gap * 2, outer_gap * 2).into();
 
-                        #[cfg(not(feature = "renderer_vulkan"))]
                         {
                             let backdrop = BackdropShader::element(
                                 renderer,
@@ -5726,7 +5720,6 @@ fn render_new_tree_windows<R>(
                 {
                     let mut active_geo = mapped.active_window_geometry().as_local();
                     active_geo.loc += geo.loc - mapped.geometry().loc.as_local();
-                    #[cfg(not(feature = "renderer_vulkan"))]
                     upper_elements.insert(
                         0,
                         CosmicMappedRenderElement::Overlay(BackdropShader::element(

@@ -250,7 +250,6 @@ impl MoveGrabState {
                 )
                 .into(),
             );
-            #[cfg(not(feature = "renderer_vulkan"))]
             push(
                 BackdropShader::element(
                     renderer,

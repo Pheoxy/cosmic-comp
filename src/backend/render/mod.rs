@@ -135,6 +135,35 @@ pub static POSTPROCESS_SHADER: &str = include_str!("./shaders/offscreen.frag");
 pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 
+/// GLES rounded-rect pixel shader, or a Vulkan solid fill until those pipelines exist.
+///
+/// Vulkan ignores corner radius. Outline indicators still need a real Vulkan shader and stay
+/// gated.
+#[cfg(not(feature = "renderer_vulkan"))]
+pub type CosmicChromeElement = PixelShaderElement;
+#[cfg(feature = "renderer_vulkan")]
+pub type CosmicChromeElement = smithay::backend::renderer::element::solid::SolidColorRenderElement;
+
+#[cfg(feature = "renderer_vulkan")]
+fn vulkan_solid_chrome(
+    geo: Rectangle<i32, Local>,
+    alpha: f32,
+    color: [f32; 3],
+) -> CosmicChromeElement {
+    let logical = geo.as_logical();
+    let geometry = Rectangle::new(
+        logical.loc.to_physical_precise_round(1f64),
+        logical.size.to_physical_precise_round(1f64),
+    );
+    smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
+        Id::new(),
+        geometry,
+        0,
+        Color32F::new(color[0], color[1], color[2], alpha),
+        Kind::Unspecified,
+    )
+}
+
 pub struct IndicatorShader(pub GlesPixelProgram);
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -371,7 +400,7 @@ impl BackdropShader {
         radius: f32,
         alpha: f32,
         color: [f32; 3],
-    ) -> PixelShaderElement {
+    ) -> CosmicChromeElement {
         let settings = BackdropSettings {
             radius,
             alpha,
@@ -380,8 +409,8 @@ impl BackdropShader {
 
         #[cfg(feature = "renderer_vulkan")]
         {
-            let _ = (renderer, key, geo, radius, alpha, color, settings);
-            unreachable!("GLES backdrop shader is not available with renderer_vulkan")
+            let _ = (renderer, key, radius, settings);
+            vulkan_solid_chrome(geo, alpha, color)
         }
         #[cfg(not(feature = "renderer_vulkan"))]
         {
