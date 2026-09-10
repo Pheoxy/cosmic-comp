@@ -1819,7 +1819,6 @@ impl Workspace {
                 &mut |elem| push(elem.into()),
             );
 
-            #[cfg(not(feature = "renderer_vulkan"))]
             if let Some(alpha) = alpha {
                 push(
                     Into::<CosmicMappedRenderElement<R>>::into(BackdropShader::element(
