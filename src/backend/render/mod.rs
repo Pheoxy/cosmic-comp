@@ -55,7 +55,7 @@ use smithay::{
         allocator::Fourcc,
         drm::{DrmDeviceFd, DrmNode},
         renderer::{
-            Color32F, Offscreen, Texture, TextureFilter,
+            Blit, Color32F, Offscreen, Texture, TextureFilter,
             damage::{Error as RenderError, OutputDamageTracker, RenderOutputResult},
             element::{
                 Element, Id, Kind, NamespacedElement, RenderElement, WeakId,
@@ -108,6 +108,18 @@ pub type GlMultiError = MultiError<KmsGraphics, KmsGraphics>;
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
     GlMulti(GlMultiRenderer<'a>),
+}
+
+impl RendererRef<'_> {
+    pub fn glow_renderer(&mut self) -> Option<&mut GlowRenderer> {
+        match self {
+            Self::Glow(renderer) => Some(renderer),
+            #[cfg(not(feature = "renderer_vulkan"))]
+            Self::GlMulti(renderer) => Some(renderer.as_mut()),
+            #[cfg(feature = "renderer_vulkan")]
+            Self::GlMulti(_) => None,
+        }
+    }
 }
 
 #[cfg(not(feature = "renderer_vulkan"))]
@@ -656,14 +668,13 @@ where
         std::mem::drop(shell_guard);
         let scale = output.current_scale().fractional_scale();
 
-        #[cfg(not(feature = "renderer_vulkan"))]
-        if let Some((state, timings)) = _fps {
+        if let (Some((state, timings)), Some(glow)) = (_fps, renderer.glow_renderer_mut()) {
             vec![
                 fps_ui(
                     _gpu,
                     debug_active,
                     &seats,
-                    renderer.glow_renderer_mut(),
+                    glow,
                     state,
                     timings,
                     Rectangle::from_size(
@@ -676,11 +687,6 @@ where
                 .into(),
             ]
         } else {
-            Vec::new()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = (_fps, renderer);
             Vec::new()
         }
     };
@@ -1279,7 +1285,7 @@ pub fn render_output<'d, R>(
     loop_handle: &calloop::LoopHandle<'static, State>,
 ) -> Result<RenderOutputResult<'d>, RenderError<R::Error>>
 where
-    R: AsGlowRenderer,
+    R: AsGlowRenderer + Blit,
     R::TextureId: Send + Clone + 'static,
     CosmicElement<R>: RenderElement<R>,
     CosmicMappedRenderElement<R>: RenderElement<R>,
@@ -1304,10 +1310,9 @@ where
         ElementFilter::All
     };
 
-    #[cfg(not(feature = "renderer_vulkan"))]
     let mut postprocess_texture = None;
     #[cfg(not(feature = "renderer_vulkan"))]
-    let result = if !screen_filter.filter.is_noop() {
+    let result = if !screen_filter.filter.is_noop() && renderer.glow_renderer().is_some() {
         if screen_filter.state.as_ref().is_none_or(|state| {
             state.output_config != PostprocessOutputConfig::for_output_untransformed(output)
         }) {
@@ -1377,6 +1382,7 @@ where
 
             let postprocess_texture_shader = renderer
                 .glow_renderer_mut()
+                .expect("postprocess requires glow")
                 .egl_context()
                 .user_data()
                 .get::<PostprocessShader>()
@@ -1519,9 +1525,7 @@ where
 
                         let mut sync = SyncPoint::default();
 
-                        #[cfg(not(feature = "renderer_vulkan"))]
                         if let (Some(damage), _) = &res {
-                            // TODO: On Vulkan, may need to combine sync points instead of just using latest?
                             let blit_to_buffer =
                                 |renderer: &mut R, blit_from: &mut R::Framebuffer<'_>| {
                                     if let Ok(dmabuf) = get_dmabuf(buffer) {
@@ -1536,9 +1540,8 @@ where
                                                 TextureFilter::Nearest,
                                             )?;
                                         }
-                                    } else {
-                                        let fb = offscreen
-                                            .expect("shm buffers should have offscreen target");
+                                        Result::<_, R::Error>::Ok(())
+                                    } else if let Some(fb) = offscreen {
                                         for rect in damage.iter() {
                                             sync = renderer.blit(
                                                 blit_from,
@@ -1548,14 +1551,12 @@ where
                                                 TextureFilter::Nearest,
                                             )?;
                                         }
+                                        Ok(())
+                                    } else {
+                                        Ok(())
                                     }
-
-                                    Result::<_, R::Error>::Ok(())
                                 };
 
-                            // we would want to just assign a different framebuffer to a variable, depending on the code-path,
-                            // but then rustc tries to equate the lifetime of target with the lifetime of our temporary fb...
-                            // So instead of duplicating all the code, we use a closure..
                             if let Some(tex) = postprocess_texture.as_mut() {
                                 let mut fb = renderer.bind(tex).map_err(RenderError::Rendering)?;
                                 blit_to_buffer(renderer, &mut fb)
@@ -1564,8 +1565,6 @@ where
                                 blit_to_buffer(renderer, target).map_err(RenderError::Rendering)?;
                             }
                         }
-                        #[cfg(feature = "renderer_vulkan")]
-                        let _ = (offscreen, buffer);
 
                         let buffers = render_element_buffers(renderer, &elements);
 
