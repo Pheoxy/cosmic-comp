@@ -247,25 +247,19 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicElement::Postprocess(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_frame = R::glow_frame_mut(frame);
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
-                }
+                let Some(glow_frame) = R::glow_frame_mut(frame) else {
+                    return Ok(());
+                };
+                RenderElement::<GlowRenderer>::draw(
+                    elem,
+                    glow_frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+                .map_err(R::from_gles_error)
             }
             CosmicElement::Zoom(elem) => elem.draw(frame, src, dst, damage, opaque_regions, cache),
             CosmicElement::Damage(elem) => {
@@ -273,25 +267,19 @@ where
             }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_frame = R::glow_frame_mut(frame);
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        glow_frame,
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, damage, opaque_regions, cache);
-                    Ok(())
-                }
+                let Some(glow_frame) = R::glow_frame_mut(frame) else {
+                    return Ok(());
+                };
+                RenderElement::<GlowRenderer>::draw(
+                    elem,
+                    glow_frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    cache,
+                )
+                .map_err(R::from_gles_error)
             }
         }
     }
@@ -302,33 +290,15 @@ where
             CosmicElement::Cursor(elem) => elem.underlying_storage(renderer),
             CosmicElement::Dnd(elem) => elem.underlying_storage(renderer),
             CosmicElement::MoveGrab(elem) => elem.underlying_storage(renderer),
-            CosmicElement::Postprocess(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_renderer = renderer.glow_renderer_mut();
-                    elem.underlying_storage(glow_renderer)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
-            }
+            CosmicElement::Postprocess(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
             CosmicElement::Zoom(elem) => elem.underlying_storage(renderer),
             CosmicElement::Damage(elem) => elem.underlying_storage(renderer),
             #[cfg(feature = "debug")]
-            CosmicElement::Egui(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_renderer = renderer.glow_renderer_mut();
-                    elem.underlying_storage(glow_renderer)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, renderer);
-                    None
-                }
-            }
+            CosmicElement::Egui(elem) => renderer
+                .glow_renderer_mut()
+                .and_then(|glow| elem.underlying_storage(glow)),
         }
     }
 
@@ -345,19 +315,13 @@ where
             CosmicElement::Dnd(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::MoveGrab(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::Postprocess(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_frame = R::glow_frame_mut(frame);
-                    RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem, glow_frame, src, dst, cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, cache);
-                    Ok(())
-                }
+                let Some(glow_frame) = R::glow_frame_mut(frame) else {
+                    return Ok(());
+                };
+                RenderElement::<GlowRenderer>::capture_framebuffer(
+                    elem, glow_frame, src, dst, cache,
+                )
+                .map_err(R::from_gles_error)
             }
             CosmicElement::Zoom(elem) => elem.capture_framebuffer(frame, src, dst, cache),
             CosmicElement::Damage(elem) => {
@@ -365,19 +329,13 @@ where
             }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let glow_frame = R::glow_frame_mut(frame);
-                    RenderElement::<GlowRenderer>::capture_framebuffer(
-                        elem, glow_frame, src, dst, cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    let _ = (elem, frame, src, dst, cache);
-                    Ok(())
-                }
+                let Some(glow_frame) = R::glow_frame_mut(frame) else {
+                    return Ok(());
+                };
+                RenderElement::<GlowRenderer>::capture_framebuffer(
+                    elem, glow_frame, src, dst, cache,
+                )
+                .map_err(R::from_gles_error)
             }
         }
     }

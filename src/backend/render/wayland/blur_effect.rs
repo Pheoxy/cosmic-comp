@@ -105,21 +105,14 @@ impl BlurShaders {
         Ok(BlurShaders { up, down })
     }
 
-    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Self {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Option<Self> {
+        renderer.glow_renderer().and_then(|glow| {
+            Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data()
                 .get::<BlurShaders>()
-                .expect("Custom Shaders not initialized")
-                .clone()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            unreachable!("GLES blur shaders are not available with renderer_vulkan")
-        }
+                .cloned()
+        })
     }
 }
 
@@ -226,21 +219,17 @@ impl BlurElement {
         radii: [u8; 4],
         strength: usize,
     ) -> Result<Option<Self>, R::Error> {
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = (
-                renderer,
-                state,
-                geometry,
-                region,
-                output_scale,
-                radii,
-                strength,
-            );
+        let Some(scaling_shaders) = BlurShaders::get(renderer) else {
             return Ok(None);
-        }
+        };
+        let Some(render_shader) = ClippingShader::get(renderer) else {
+            return Ok(None);
+        };
+        let renderer_id = renderer
+            .glow_renderer()
+            .expect("blur shaders imply glow")
+            .context_id();
 
-        #[cfg(not(feature = "renderer_vulkan"))]
         {
             if strength == 0 || geometry.size.w == 0. || geometry.size.h == 0. {
                 return Ok(None);
@@ -291,7 +280,6 @@ impl BlurElement {
             let extended_offset =
                 Point::<f64, Physical>::new(radius, radius).to_logical(output_scale);
 
-            let renderer_id = renderer.glow_renderer().context_id();
             let src = geometry.size.to_buffer(output_scale, Transform::Normal);
             let params = &BLUR_PARAMS[strength.min(MAX_STEPS - 1)];
 
@@ -319,8 +307,8 @@ impl BlurElement {
                 src,
                 geometry,
                 extended_offset,
-                scaling_shaders: BlurShaders::get(renderer),
-                render_shader: ClippingShader::get(renderer),
+                scaling_shaders,
+                render_shader,
                 offset: state.offset,
                 passes: state.passes,
                 region: region
@@ -402,16 +390,12 @@ where
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = (frame, src, dst, cache);
+        let transform = frame.transformation();
+        let Some(glow_frame) = R::glow_frame_mut(frame) else {
             return Ok(());
-        }
-        #[cfg(not(feature = "renderer_vulkan"))]
+        };
         {
-            let transform = frame.transformation();
             let tex_size = self.src.to_i32_round();
-            let glow_frame = <R as AsGlowRenderer>::glow_frame_mut(frame);
             let gles_frame = BorrowMut::<GlesFrame<'_, '_>>::borrow_mut(glow_frame);
             let mut renderer = gles_frame.renderer();
 
@@ -490,38 +474,32 @@ where
             .flat_map(|rect| damage.iter().flat_map(move |r| r.intersection(rect)))
             .collect::<Vec<_>>();
         let cache = cache.expect("Framebuffer element without cache?");
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = (frame, src, dst, damage, opaque_regions, cache);
+        let Some(texture) = cache.get::<BlurTexture<R::TextureId>>() else {
             return Ok(());
-        }
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let Some(texture) = cache.get::<BlurTexture<R::TextureId>>() else {
-                return Err(R::from_gles_error(GlesError::BlitError));
-            };
-            let texture_ref = texture.lock().unwrap();
+        };
+        let texture_ref = texture.lock().unwrap();
 
-            if let Some(tex) = texture_ref.as_ref() {
-                BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                    .override_default_tex_program(
-                        self.render_shader.clone(),
-                        self.uniforms.clone(),
-                    );
-                frame.render_texture_from_to(
-                    tex,
-                    src,
-                    dst,
-                    &damage,
-                    opaque_regions,
-                    Transform::Normal,
-                    1.0,
-                )?;
-                BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                    .clear_tex_program_override();
+        if let Some(tex) = texture_ref.as_ref() {
+            if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame).override_default_tex_program(
+                    self.render_shader.clone(),
+                    self.uniforms.clone(),
+                );
             }
-            Ok(())
+            frame.render_texture_from_to(
+                tex,
+                src,
+                dst,
+                &damage,
+                opaque_regions,
+                Transform::Normal,
+                1.0,
+            )?;
+            if let Some(glow_frame) = R::glow_frame_mut(frame) {
+                BorrowMut::<GlesFrame>::borrow_mut(glow_frame).clear_tex_program_override();
+            }
         }
+        Ok(())
     }
 }
 
