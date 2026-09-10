@@ -317,6 +317,9 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.backend
+            .retire_surface_tree_textures(surface.wl_surface());
+
         for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface.wl_surface()) {
             if let smithay::desktop::PopupKind::Xdg(ref xdg_popup) = popup {
                 xdg_popup.send_popup_done();
@@ -387,6 +390,11 @@ impl XdgShellHandler for State {
         if let Some(output) = output.as_ref() {
             self.backend.schedule_render(output);
         }
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.backend
+            .retire_surface_tree_textures(surface.wl_surface());
     }
 
     fn show_window_menu(

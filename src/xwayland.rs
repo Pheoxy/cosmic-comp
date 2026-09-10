@@ -876,6 +876,10 @@ impl XwmHandler for State {
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(wl_surface) = window.wl_surface() {
+            self.backend.retire_surface_tree_textures(&wl_surface);
+        }
+
         let mut shell = self.common.shell.write();
         if window.is_override_redirect() {
             shell.override_redirect_windows.retain(|or| or != &window);

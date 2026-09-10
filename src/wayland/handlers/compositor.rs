@@ -288,6 +288,11 @@ impl CompositorHandler for State {
         }
 
         if with_renderer_surface_state(surface, |state| state.buffer().is_none()).unwrap_or(false) {
+            // Null-commit retires cached textures. Mesa/NVIDIA keep the imported
+            // EGLImage/VkImage until destroy; smithay's surface destructor has no
+            // renderer, so release while we still have one (Anvil/Mutter/Weston).
+            self.backend.retire_surface_tree_textures(surface);
+
             // handle null-commits causing weird conflicts:
 
             // session-lock disallows null commits
@@ -325,9 +330,11 @@ impl CompositorHandler for State {
                     }
                 } else {
                     std::mem::drop(shell);
-                    seat.get_pointer()
-                        .unwrap()
-                        .unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::from_millis(0));
+                    seat.get_pointer().unwrap().unset_grab(
+                        self,
+                        SERIAL_COUNTER.next_serial(),
+                        InputTime::from_millis(0),
+                    );
                     return;
                 }
             }

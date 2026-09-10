@@ -421,6 +421,62 @@ impl BackendData {
         }
     }
 
+    /// Release renderer-cached surface textures while a renderer is still available.
+    ///
+    /// Mutter/Weston destroy GPU objects on `wl_buffer` destroy. Mesa and NVIDIA keep the
+    /// imported image until then. Smithay's surface destructor has no renderer, so Anvil and
+    /// cosmic-comp must call this on unmap/destroy (and before dropping the renderer).
+    pub fn retire_surface_tree_textures(&mut self, surface: &WlSurface) {
+        use smithay::backend::renderer::utils::retire_and_release_surface_tree_textures;
+        use tracing::warn;
+
+        match self {
+            BackendData::Kms(kms) => {
+                let Some(node) = *kms.primary_node.read().unwrap() else {
+                    return;
+                };
+                match kms.api.single_renderer(&node) {
+                    Ok(mut renderer) => {
+                        if let Err(err) =
+                            retire_and_release_surface_tree_textures(&mut renderer, surface)
+                        {
+                            warn!(?err, "Failed to release retired surface textures");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "Failed to get KMS renderer for surface texture release"
+                        )
+                    }
+                }
+            }
+            BackendData::Winit(state) => {
+                if let Err(err) =
+                    retire_and_release_surface_tree_textures(state.backend.renderer(), surface)
+                {
+                    warn!(?err, "Failed to release retired surface textures");
+                }
+            }
+            #[cfg(feature = "renderer_vulkan")]
+            BackendData::WinitVulkan(state) => {
+                if let Err(err) =
+                    retire_and_release_surface_tree_textures(state.backend.renderer(), surface)
+                {
+                    warn!(?err, "Failed to release retired surface textures");
+                }
+            }
+            BackendData::X11(state) => {
+                if let Err(err) =
+                    retire_and_release_surface_tree_textures(&mut state.renderer, surface)
+                {
+                    warn!(?err, "Failed to release retired surface textures");
+                }
+            }
+            BackendData::Unset => {}
+        }
+    }
+
     pub fn dmabuf_imported(
         &mut self,
         client: Option<Client>,
