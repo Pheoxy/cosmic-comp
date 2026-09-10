@@ -1382,23 +1382,7 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicMappedRenderElement::TiledOverlay(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        R::glow_frame_mut(frame),
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                }
+                RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicMappedRenderElement::MovingStack(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
@@ -1413,42 +1397,10 @@ where
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicMappedRenderElement::FocusIndicator(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        R::glow_frame_mut(frame),
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                }
+                RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicMappedRenderElement::Overlay(elem) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    RenderElement::<GlowRenderer>::draw(
-                        elem,
-                        R::glow_frame_mut(frame),
-                        src,
-                        dst,
-                        damage,
-                        opaque_regions,
-                        cache,
-                    )
-                    .map_err(R::from_gles_error)
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                }
+                RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
             }
             CosmicMappedRenderElement::StackHoverIndicator(elem) => {
                 elem.draw(frame, src, dst, damage, opaque_regions, cache)

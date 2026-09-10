@@ -31,22 +31,14 @@ pub struct ShadowParameters {
 type ShadowCache = RefCell<HashMap<CosmicMappedKey, (ShadowParameters, PixelShaderElement)>>;
 
 impl ShadowShader {
-    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> Option<GlesPixelProgram> {
+        renderer.glow_renderer().and_then(|glow| {
+            Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data()
                 .get::<ShadowShader>()
-                .expect("Custom Shaders not initialized")
-                .0
-                .clone()
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            unreachable!("GLES shadow shader is not available with renderer_vulkan")
-        }
+                .map(|shader| shader.0.clone())
+        })
     }
 
     pub fn element<R: AsGlowRenderer>(
@@ -57,7 +49,7 @@ impl ShadowShader {
         alpha: f32,
         scale: f64,
         dark_mode: bool,
-    ) -> PixelShaderElement {
+    ) -> crate::backend::render::CosmicChromeElement {
         let params = ShadowParameters {
             geo,
             scale,
@@ -74,14 +66,14 @@ impl ShadowShader {
         geo.size.w -= fractional_pixel * 2.;
         geo.size.h -= fractional_pixel * 2.;
 
-        #[cfg(feature = "renderer_vulkan")]
+        let Some(shader) = Self::get(renderer) else {
+            return crate::backend::render::CosmicChromeElement::skip();
+        };
+        let glow = renderer
+            .glow_renderer()
+            .expect("shadow shader implies glow");
         {
-            let _ = (renderer, key, geo, radius, alpha, scale, dark_mode, params);
-            unreachable!("GLES shadow shader is not available with renderer_vulkan")
-        }
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+            let user_data = Borrow::<GlesRenderer>::borrow(glow)
                 .egl_context()
                 .user_data();
             user_data.insert_if_missing(|| ShadowCache::new(HashMap::new()));
@@ -93,8 +85,6 @@ impl ShadowShader {
                 .filter(|(old_params, _)| &params == old_params)
                 .is_none()
             {
-                let shader = Self::get(renderer);
-
                 let softness = 25.;
                 let spread = 5.;
                 let offset = [0., 5.];
@@ -201,7 +191,7 @@ impl ShadowShader {
                 cache.insert(key.clone(), (params, element));
             }
 
-            cache.get(&key).unwrap().1.clone()
+            crate::backend::render::CosmicChromeElement::shader(cache.get(&key).unwrap().1.clone())
         }
     }
 }

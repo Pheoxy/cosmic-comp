@@ -138,7 +138,6 @@ impl MoveGrabState {
             .corner_radius(window_geo.size, self.indicator_thickness);
 
         if self.indicator_thickness > 0 {
-            #[cfg(not(feature = "renderer_vulkan"))]
             push(
                 IndicatorShader::focus_element(
                     renderer,
@@ -227,7 +226,6 @@ impl MoveGrabState {
             let base_color = theme.palette.neutral_9;
             let overlay_geometry = t.overlay_geometry(non_exclusive_geometry, gaps);
 
-            #[cfg(not(feature = "renderer_vulkan"))]
             push(
                 IndicatorShader::element(
                     renderer,

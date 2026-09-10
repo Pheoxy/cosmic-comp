@@ -4544,7 +4544,6 @@ where
                     if let Some(renderer) = renderer.as_mut() {
                         if (render_potential_group || render_active_child) && Some(&node_id) != root
                         {
-                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -4563,7 +4562,6 @@ where
                             && pill_indicator.is_some()
                             && Some(&node_id) != root
                         {
-                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -4628,7 +4626,6 @@ where
                             };
 
                             if draw_outline {
-                                #[cfg(not(feature = "renderer_vulkan"))]
                                 push(
                                     IndicatorShader::element(
                                         *renderer,
@@ -4866,7 +4863,6 @@ where
 
                     if let Some(renderer) = renderer.as_mut() {
                         if render_potential_group {
-                            #[cfg(not(feature = "renderer_vulkan"))]
                             push(
                                 IndicatorShader::element(
                                     *renderer,
@@ -5083,7 +5079,6 @@ fn render_old_tree_windows<R>(
         |mapped, elem_geometry, geo, alpha, is_minimizing| {
             let radius = mapped.corner_radius(geo.size.as_logical(), indicator_thickness);
             if is_minimizing && indicator_thickness > 0 {
-                #[cfg(not(feature = "renderer_vulkan"))]
                 push(CosmicMappedRenderElement::FocusIndicator(
                     IndicatorShader::focus_element(
                         renderer,
@@ -5403,7 +5398,6 @@ fn render_new_tree_windows<R>(
             .radius_s()
             .map(|x| if x < 4.0 { x } else { x + 4.0 })
             .map(|val| (val * scale.x.min(scale.y) as f32).round() as u8);
-        #[cfg(not(feature = "renderer_vulkan"))]
         swap_elements.push(CosmicMappedRenderElement::FocusIndicator(
             IndicatorShader::focus_element(
                 renderer,
@@ -5519,7 +5513,6 @@ fn render_new_tree_windows<R>(
                         .unwrap_or(false)
                         || focused.as_ref() == Some(&node_id)
                     {
-                        #[cfg(not(feature = "renderer_vulkan"))]
                         indicators.push(CosmicMappedRenderElement::FocusIndicator(
                             IndicatorShader::focus_element(
                                 renderer,

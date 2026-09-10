@@ -433,53 +433,54 @@ where
     }
 }
 
-#[cfg(not(feature = "renderer_vulkan"))]
-pub trait AsGlowRenderer:
-    Renderer
-    + Offscreen<GlesTexture>
-    + Offscreen<GlesRenderbuffer>
-    + ImportAll
-    + ImportMem
-    + ExportMem
-    + Bind<Dmabuf>
-    + Blit
-{
-    fn glow_renderer(&self) -> &GlowRenderer;
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer;
+/// Renderer capability for compositor chrome and GLES-only effects.
+///
+/// Glow/GLES backends return `Some`. Vulkan (and any non-GL `MultiRenderer`) return `None`;
+/// chrome then uses [`super::chrome::CosmicChromeElement`] solid fills or skips.
+pub trait AsGlowRenderer: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> {
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        None
+    }
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        None
+    }
     fn glow_frame<'a, 'frame, 'buffer>(
-        frame: &'a Self::Frame<'frame, 'buffer>,
-    ) -> &'a GlowFrame<'frame, 'buffer>;
+        _frame: &'a Self::Frame<'frame, 'buffer>,
+    ) -> Option<&'a GlowFrame<'frame, 'buffer>> {
+        None
+    }
     fn glow_frame_mut<'a, 'frame, 'buffer>(
-        frame: &'a mut Self::Frame<'frame, 'buffer>,
-    ) -> &'a mut GlowFrame<'frame, 'buffer>;
+        _frame: &'a mut Self::Frame<'frame, 'buffer>,
+    ) -> Option<&'a mut GlowFrame<'frame, 'buffer>> {
+        None
+    }
+    fn from_gles_error(err: GlesError) -> Self::Error;
     fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId;
     fn tex_to_gl(
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture>;
-    fn from_gles_error(err: GlesError) -> Self::Error;
 }
 
-#[cfg(feature = "renderer_vulkan")]
-pub trait AsGlowRenderer: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> {}
-
-#[cfg(not(feature = "renderer_vulkan"))]
 impl AsGlowRenderer for GlowRenderer {
-    fn glow_renderer(&self) -> &GlowRenderer {
-        self
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        Some(self)
     }
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
-        self
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        Some(self)
     }
     fn glow_frame<'a, 'frame, 'buffer>(
         frame: &'a Self::Frame<'frame, 'buffer>,
-    ) -> &'a GlowFrame<'frame, 'buffer> {
-        frame
+    ) -> Option<&'a GlowFrame<'frame, 'buffer>> {
+        Some(frame)
     }
     fn glow_frame_mut<'a, 'frame, 'buffer>(
         frame: &'a mut Self::Frame<'frame, 'buffer>,
-    ) -> &'a mut GlowFrame<'frame, 'buffer> {
-        frame
+    ) -> Option<&'a mut GlowFrame<'frame, 'buffer>> {
+        Some(frame)
+    }
+    fn from_gles_error(err: GlesError) -> Self::Error {
+        err
     }
     fn tex_from_gl(_context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
         texture
@@ -490,31 +491,28 @@ impl AsGlowRenderer for GlowRenderer {
     ) -> Option<GlesTexture> {
         Some(texture.clone())
     }
-    fn from_gles_error(err: GlesError) -> Self::Error {
-        err
-    }
 }
-
-#[cfg(feature = "renderer_vulkan")]
-impl AsGlowRenderer for GlowRenderer {}
 
 #[cfg(not(feature = "renderer_vulkan"))]
 impl AsGlowRenderer for GlMultiRenderer<'_> {
-    fn glow_renderer(&self) -> &GlowRenderer {
-        self.as_ref()
+    fn glow_renderer(&self) -> Option<&GlowRenderer> {
+        Some(self.as_ref())
     }
-    fn glow_renderer_mut(&mut self) -> &mut GlowRenderer {
-        self.as_mut()
+    fn glow_renderer_mut(&mut self) -> Option<&mut GlowRenderer> {
+        Some(self.as_mut())
     }
     fn glow_frame<'b, 'frame, 'buffer>(
         frame: &'b Self::Frame<'frame, 'buffer>,
-    ) -> &'b GlowFrame<'frame, 'buffer> {
-        frame.as_ref()
+    ) -> Option<&'b GlowFrame<'frame, 'buffer>> {
+        Some(frame.as_ref())
     }
     fn glow_frame_mut<'b, 'frame, 'buffer>(
         frame: &'b mut Self::Frame<'frame, 'buffer>,
-    ) -> &'b mut GlowFrame<'frame, 'buffer> {
-        frame.as_mut()
+    ) -> Option<&'b mut GlowFrame<'frame, 'buffer>> {
+        Some(frame.as_mut())
+    }
+    fn from_gles_error(err: GlesError) -> Self::Error {
+        GlMultiError::Render(err)
     }
     fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
         MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap()
@@ -525,16 +523,41 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
     ) -> Option<GlesTexture> {
         texture.get::<GbmGlowBackend<DrmDeviceFd>>(context)
     }
-    fn from_gles_error(err: GlesError) -> Self::Error {
-        GlMultiError::Render(err)
+}
+
+#[cfg(feature = "renderer_vulkan")]
+impl AsGlowRenderer for GlMultiRenderer<'_> {
+    fn from_gles_error(_err: GlesError) -> Self::Error {
+        smithay::backend::renderer::multigpu::Error::Render(
+            smithay::backend::renderer::vulkan::VulkanError::UnsupportedOperation("gles chrome"),
+        )
+    }
+    fn tex_from_gl(_context: &ContextId<GlesTexture>, _texture: GlesTexture) -> Self::TextureId {
+        unreachable!("gles texture import on vulkan multi renderer")
+    }
+    fn tex_to_gl(
+        _context: &ContextId<GlesTexture>,
+        _texture: &Self::TextureId,
+    ) -> Option<GlesTexture> {
+        None
     }
 }
 
 #[cfg(feature = "renderer_vulkan")]
-impl AsGlowRenderer for GlMultiRenderer<'_> {}
-
-#[cfg(feature = "renderer_vulkan")]
-impl AsGlowRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {}
+impl AsGlowRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
+    fn from_gles_error(_err: GlesError) -> Self::Error {
+        smithay::backend::renderer::vulkan::VulkanError::UnsupportedOperation("gles chrome")
+    }
+    fn tex_from_gl(_context: &ContextId<GlesTexture>, _texture: GlesTexture) -> Self::TextureId {
+        unreachable!("gles texture import on vulkan renderer")
+    }
+    fn tex_to_gl(
+        _context: &ContextId<GlesTexture>,
+        _texture: &Self::TextureId,
+    ) -> Option<GlesTexture> {
+        None
+    }
+}
 
 pub struct DamageElement {
     id: Id,
