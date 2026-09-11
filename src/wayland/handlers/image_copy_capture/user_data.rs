@@ -3,15 +3,19 @@
 use std::{cell::RefCell, sync::Mutex};
 
 use smithay::{
-    backend::renderer::{
-        ContextId,
-        damage::OutputDamageTracker,
-        gles::{GlesRenderbuffer, GlesTexture},
-    },
+    backend::renderer::damage::OutputDamageTracker,
     output::Output,
     wayland::image_copy_capture::{
         CursorSession, CursorSessionRef, Frame, FrameRef, Session, SessionRef,
     },
+};
+
+#[cfg(feature = "renderer_vulkan")]
+use smithay::backend::renderer::vulkan::VulkanRenderTarget;
+#[cfg(not(feature = "renderer_vulkan"))]
+use smithay::backend::renderer::{
+    ContextId,
+    gles::{GlesRenderbuffer, GlesTexture},
 };
 
 use crate::shell::{CosmicSurface, Workspace};
@@ -23,7 +27,10 @@ pub type SessionData = Mutex<SessionUserData>;
 
 pub struct SessionUserData {
     pub dt: OutputDamageTracker,
+    #[cfg(not(feature = "renderer_vulkan"))]
     pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
+    #[cfg(feature = "renderer_vulkan")]
+    pub offscreen: Option<VulkanRenderTarget<'static>>,
 }
 
 impl SessionUserData {
