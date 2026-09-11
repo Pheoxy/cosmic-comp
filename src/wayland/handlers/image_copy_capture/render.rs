@@ -5,14 +5,13 @@ use smithay::{
     backend::{
         allocator::{Buffer, Fourcc, format::get_transparent},
         renderer::{
-            BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
-            buffer_dimensions, buffer_type,
+            BufferType, Color32F, ExportMem, ImportAll, ImportMem, buffer_dimensions, buffer_type,
             damage::{Error as DTError, OutputDamageTracker, RenderOutputResult},
             element::{
                 RenderElement, UnderlyingStorage,
                 utils::{Relocate, RelocateRenderElement},
             },
-            gles::{GlesError, GlesRenderbuffer},
+            gles::GlesError,
             sync::SyncPoint,
             utils::with_renderer_surface_state,
         },
@@ -34,6 +33,9 @@ use smithay::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+#[cfg(not(feature = "renderer_vulkan"))]
+use smithay::backend::renderer::{Offscreen, gles::GlesRenderbuffer};
 
 use crate::{
     backend::render::{
@@ -57,6 +59,9 @@ use crate::{
 use super::{
     super::data_device::get_dnd_icon, cursor_capture_constraints, user_data::SessionHolder,
 };
+
+#[cfg(feature = "renderer_vulkan")]
+use smithay::backend::renderer::Texture;
 
 pub fn render_element_buffers<R, E>(
     renderer: &mut R,
@@ -143,13 +148,6 @@ where
     let buffer = frame.buffer();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
 
-    #[cfg(feature = "renderer_vulkan")]
-    if offscreen.is_some() {
-        frame.fail(CaptureFailureReason::Unknown);
-        return Ok(None);
-    }
-
-    #[cfg(not(feature = "renderer_vulkan"))]
     if let Some(fb) = offscreen {
         assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
         if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
@@ -170,9 +168,19 @@ where
             // ensure rendering is done
             renderer.wait(&sync)?;
 
-            let format = get_transparent(format).unwrap_or(format);
+            let copy_format = {
+                #[cfg(feature = "renderer_vulkan")]
+                {
+                    let _ = get_transparent(format);
+                    format
+                }
+                #[cfg(not(feature = "renderer_vulkan"))]
+                {
+                    get_transparent(format).unwrap_or(format)
+                }
+            };
             let mapping =
-                renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), format)?;
+                renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), copy_format)?;
             let gl_data = renderer.map_texture(&mapping)?;
             assert!((width * height * pixelsize) as usize <= gl_data.len());
 
@@ -244,23 +252,15 @@ where
 
     let mut age = 1;
     if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let _ = renderer;
-            session_user_data.offscreen = None;
-            frame.fail(CaptureFailureReason::Unknown);
-            return Ok(None);
-        }
+        let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
+        let format = with_buffer_contents(&buffer, |_, _, data| {
+            shm_format_to_fourcc(data.format)
+                .expect("We should be able to convert all hardcoded shm screencopy formats")
+        })
+        .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
+
         #[cfg(not(feature = "renderer_vulkan"))]
         {
-            let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
-            let format = with_buffer_contents(&buffer, |_, _, data| {
-                shm_format_to_fourcc(data.format)
-                    .expect("We should be able to convert all hardcoded shm screencopy formats")
-            })
-            .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
-
-            // Re-allocate if context id, size, or format are different
             session_user_data
                 .offscreen
                 .take_if(|(context_id, renderbuffer)| {
@@ -275,8 +275,21 @@ where
                         .map_err(DTError::Rendering)?;
                 session_user_data.offscreen =
                     Some((renderer.glow_renderer().context_id(), renderbuffer));
-                // If we're allocating a new offscreen buffer, we need to re-render everything
-                // (or copy the contexts of the shm buffer)
+                age = 0;
+            }
+        }
+
+        #[cfg(feature = "renderer_vulkan")]
+        {
+            session_user_data
+                .offscreen
+                .take_if(|target| target.size() != size || target.format() != Some(format));
+
+            if session_user_data.offscreen.is_none() {
+                let target = renderer
+                    .create_vulkan_capture_target(format, size)
+                    .map_err(DTError::Rendering)?;
+                session_user_data.offscreen = Some(target);
                 age = 0;
             }
         }
@@ -293,8 +306,13 @@ where
         .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
         .transpose()?;
     #[cfg(feature = "renderer_vulkan")]
-    let mut fb: Option<R::Framebuffer<'_>> = {
-        let _ = offscreen;
+    let mut fb = if let Some(target) = offscreen.as_mut() {
+        Some(
+            renderer
+                .bind_vulkan_capture_target(target)
+                .map_err(DTError::Rendering)?,
+        )
+    } else {
         None
     };
     let (result, buffers) = render_fn(
@@ -489,6 +507,7 @@ pub fn render_workspace_to_buffer(
         }
     };
     let result = match renderer {
+        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
@@ -516,6 +535,11 @@ pub fn render_workspace_to_buffer(
                     None
                 }
             }
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        RendererRef::Glow(_) => {
+            frame.fail(CaptureFailureReason::Unknown);
+            None
         }
         RendererRef::GlMulti(mut renderer) => {
             match render_session(
@@ -761,6 +785,7 @@ pub fn render_window_to_buffer(
         }
     };
     let result = match renderer {
+        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => match render_session(
             renderer,
             session.user_data().get::<SessionData>().unwrap(),
@@ -787,6 +812,11 @@ pub fn render_window_to_buffer(
                 None
             }
         },
+        #[cfg(feature = "renderer_vulkan")]
+        RendererRef::Glow(_) => {
+            frame.fail(CaptureFailureReason::Unknown);
+            None
+        }
         RendererRef::GlMulti(mut renderer) => match render_session(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
@@ -927,6 +957,7 @@ pub fn render_cursor_to_buffer(
         }
     };
     let result = match renderer {
+        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
@@ -952,6 +983,11 @@ pub fn render_cursor_to_buffer(
                     None
                 }
             }
+        }
+        #[cfg(feature = "renderer_vulkan")]
+        RendererRef::Glow(_) => {
+            frame.fail(CaptureFailureReason::Unknown);
+            None
         }
         RendererRef::GlMulti(mut renderer) => {
             match render_session(
