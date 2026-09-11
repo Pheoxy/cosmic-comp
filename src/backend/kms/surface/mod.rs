@@ -97,7 +97,7 @@ use std::{
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod timings;
@@ -157,6 +157,8 @@ pub struct SurfaceThreadState {
     egui: EguiState,
 
     last_sequence: Option<u32>,
+    /// Last time we warned that Kind::Cursor was not assigned to the KMS cursor plane.
+    last_cursor_plane_miss: Option<Instant>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -588,6 +590,7 @@ fn surface_thread(
         egui,
 
         last_sequence: None,
+        last_cursor_plane_miss: None,
         vblank_frame: None,
         vblank_frame_name,
         time_since_presentation_plot_name,
@@ -1097,7 +1100,10 @@ impl SurfaceThreadState {
         };
 
         if has_active_fullscreen || animations_going {
-            // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
+            // Overlay planes are for steady client dmabufs (video/fullscreen), not for
+            // transforming windows. KWin skips overlays while effects run; atomic TESTs
+            // are slow and have frozen some AMD/NVIDIA commits. Do not clear
+            // ALLOW_CURSOR_PLANE_SCANOUT here — that is the hardware pointer, not an overlay.
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 
@@ -1375,6 +1381,33 @@ impl SurfaceThreadState {
 
         match res {
             Ok(frame_result) => {
+                let had_cursor = elements.iter().any(|elem| elem.kind() == Kind::Cursor);
+                let hw_cursor = frame_result.cursor_element.is_some();
+                let primary = match &frame_result.primary_element {
+                    PrimaryPlaneElement::Swapchain(_) => "composited",
+                    PrimaryPlaneElement::Element(_) => "scanout",
+                };
+                trace!(
+                    primary,
+                    overlays = frame_result.overlay_elements.len(),
+                    hw_cursor,
+                    "kms frame planes"
+                );
+                if had_cursor && !hw_cursor {
+                    let now = Instant::now();
+                    let should_warn = self
+                        .last_cursor_plane_miss
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5));
+                    if should_warn {
+                        warn!(
+                            "cursor plane not assigned; pointer composited on primary (software cursor)"
+                        );
+                        self.last_cursor_plane_miss = Some(now);
+                    }
+                } else if hw_cursor {
+                    self.last_cursor_plane_miss = None;
+                }
+
                 let (tx, rx) = std::sync::mpsc::channel();
 
                 let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
