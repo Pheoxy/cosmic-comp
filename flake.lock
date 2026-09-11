@@ -72,7 +72,8 @@
         "nix-filter": "nix-filter",
         "nixpkgs": "nixpkgs",
         "parts": "parts",
-        "rust": "rust"
+        "rust": "rust",
+        "smithay-vulkan": "smithay-vulkan"
       }
     },
     "rust": {
@@ -92,6 +93,23 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "smithay-vulkan": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789146823,
+        "narHash": "sha256-tntP5WDnVeyDViwKYxgoVz2AOMPt5aJ9VphXZ8tc36U=",
+        "owner": "Pheoxy",
+        "repo": "smithay",
+        "rev": "e782d4cbd2fbbba952cc9fe9cf7a352baed0c727",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Pheoxy",
+        "ref": "add-vulkan-renderer-support-cosmic-e3d461a",
+        "repo": "smithay",
         "type": "github"
       }
     }
