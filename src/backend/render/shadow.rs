@@ -58,13 +58,9 @@ impl ShadowShader {
             dark_mode,
         };
         let Some(shader) = Self::get(renderer) else {
-            let mut shadow_geo = params.geo;
-            shadow_geo.loc.y += 4;
-            shadow_geo.size.w = shadow_geo.size.w.saturating_add(8);
-            shadow_geo.size.h = shadow_geo.size.h.saturating_add(8);
-            shadow_geo.loc.x -= 4;
-            let a = alpha * if dark_mode { 0.45 } else { 0.35 };
-            return crate::backend::render::CosmicChromeElement::fill(shadow_geo, a, [0., 0., 0.]);
+            return crate::backend::render::CosmicChromeElement::stacked_shadow(
+                params.geo, alpha, dark_mode,
+            );
         };
 
         let ceil = |logical: f64| (logical * scale).ceil() / scale;
