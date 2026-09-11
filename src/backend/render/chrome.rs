@@ -2,8 +2,8 @@
 //!
 //! Callers construct [`CosmicChromeElement`] and draw it with [`RenderElement<R>`]. Glow/GLES
 //! uses the rounded pixel shader when a glow frame exists. Vulkan, Pixman, and any other
-//! `Frame::draw_solid` renderer get a logical-space solid fill (fills) or a no-op (outlines
-//! and shadows until those pipelines exist).
+//! `Frame::draw_solid` renderer get a logical-space solid fill, a four-rect border, or a
+//! no-op. Rounded corners, blur, and true shadows wait on Vulkan pipelines.
 
 use smithay::{
     backend::renderer::{
@@ -23,10 +23,11 @@ use crate::utils::prelude::{Local, RectLocalExt};
 
 use super::element::AsGlowRenderer;
 
-/// Rounded GLES shader, solid fill, or a no-op.
+/// Rounded GLES shader, solid fill, axis-aligned border, or a no-op.
 #[derive(Debug, Clone)]
 pub enum CosmicChromeElement {
     Solid(SolidChromeElement),
+    Border(BorderChromeElement),
     Shader(PixelShaderElement),
     Skip(SkipChromeElement),
 }
@@ -35,6 +36,14 @@ impl CosmicChromeElement {
     pub fn fill(geo: Rectangle<i32, Local>, alpha: f32, color: [f32; 3]) -> Self {
         Self::Solid(SolidChromeElement::new(
             geo,
+            Color32F::new(color[0], color[1], color[2], alpha),
+        ))
+    }
+
+    pub fn border(geo: Rectangle<i32, Local>, thickness: u8, alpha: f32, color: [f32; 3]) -> Self {
+        Self::Border(BorderChromeElement::new(
+            geo,
+            thickness,
             Color32F::new(color[0], color[1], color[2], alpha),
         ))
     }
@@ -61,6 +70,28 @@ impl SolidChromeElement {
         Self {
             id: Id::new(),
             geo: geo.as_logical(),
+            color,
+            commit: CommitCounter::default(),
+        }
+    }
+}
+
+/// Axis-aligned border drawn with four `draw_solid` rects (Vulkan/Pixman focus rings).
+#[derive(Debug, Clone)]
+pub struct BorderChromeElement {
+    id: Id,
+    geo: Rectangle<i32, Logical>,
+    thickness: u8,
+    color: Color32F,
+    commit: CommitCounter,
+}
+
+impl BorderChromeElement {
+    pub fn new(geo: Rectangle<i32, Local>, thickness: u8, color: Color32F) -> Self {
+        Self {
+            id: Id::new(),
+            geo: geo.as_logical(),
+            thickness,
             color,
             commit: CommitCounter::default(),
         }
@@ -112,6 +143,32 @@ impl Element for SolidChromeElement {
     }
 }
 
+impl Element for BorderChromeElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        Rectangle::from_size((1.0, 1.0).into())
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.geo.to_physical_precise_round(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.color.a()
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+}
+
 impl Element for SkipChromeElement {
     fn id(&self) -> &Id {
         &self.id
@@ -138,6 +195,7 @@ impl Element for CosmicChromeElement {
     fn id(&self) -> &Id {
         match self {
             Self::Solid(elem) => elem.id(),
+            Self::Border(elem) => elem.id(),
             Self::Shader(elem) => elem.id(),
             Self::Skip(elem) => elem.id(),
         }
@@ -146,6 +204,7 @@ impl Element for CosmicChromeElement {
     fn current_commit(&self) -> CommitCounter {
         match self {
             Self::Solid(elem) => elem.current_commit(),
+            Self::Border(elem) => elem.current_commit(),
             Self::Shader(elem) => elem.current_commit(),
             Self::Skip(elem) => elem.current_commit(),
         }
@@ -154,6 +213,7 @@ impl Element for CosmicChromeElement {
     fn src(&self) -> Rectangle<f64, BufferCoords> {
         match self {
             Self::Solid(elem) => elem.src(),
+            Self::Border(elem) => elem.src(),
             Self::Shader(elem) => elem.src(),
             Self::Skip(elem) => elem.src(),
         }
@@ -162,6 +222,7 @@ impl Element for CosmicChromeElement {
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             Self::Solid(elem) => elem.geometry(scale),
+            Self::Border(elem) => elem.geometry(scale),
             Self::Shader(elem) => elem.geometry(scale),
             Self::Skip(elem) => elem.geometry(scale),
         }
@@ -170,6 +231,7 @@ impl Element for CosmicChromeElement {
     fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
         match self {
             Self::Solid(elem) => elem.location(scale),
+            Self::Border(elem) => elem.location(scale),
             Self::Shader(elem) => elem.location(scale),
             Self::Skip(elem) => elem.location(scale),
         }
@@ -178,6 +240,7 @@ impl Element for CosmicChromeElement {
     fn transform(&self) -> Transform {
         match self {
             Self::Solid(elem) => elem.transform(),
+            Self::Border(elem) => elem.transform(),
             Self::Shader(elem) => elem.transform(),
             Self::Skip(elem) => elem.transform(),
         }
@@ -190,6 +253,7 @@ impl Element for CosmicChromeElement {
     ) -> DamageSet<i32, Physical> {
         match self {
             Self::Solid(elem) => elem.damage_since(scale, commit),
+            Self::Border(elem) => elem.damage_since(scale, commit),
             Self::Shader(elem) => elem.damage_since(scale, commit),
             Self::Skip(elem) => elem.damage_since(scale, commit),
         }
@@ -198,6 +262,7 @@ impl Element for CosmicChromeElement {
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             Self::Solid(elem) => elem.opaque_regions(scale),
+            Self::Border(elem) => elem.opaque_regions(scale),
             Self::Shader(elem) => elem.opaque_regions(scale),
             Self::Skip(elem) => elem.opaque_regions(scale),
         }
@@ -206,6 +271,7 @@ impl Element for CosmicChromeElement {
     fn alpha(&self) -> f32 {
         match self {
             Self::Solid(elem) => elem.alpha(),
+            Self::Border(elem) => elem.alpha(),
             Self::Shader(elem) => elem.alpha(),
             Self::Skip(_) => 0.0,
         }
@@ -214,6 +280,7 @@ impl Element for CosmicChromeElement {
     fn kind(&self) -> Kind {
         match self {
             Self::Solid(elem) => elem.kind(),
+            Self::Border(elem) => elem.kind(),
             Self::Shader(elem) => elem.kind(),
             Self::Skip(elem) => elem.kind(),
         }
@@ -234,6 +301,50 @@ impl<R: Renderer> RenderElement<R> for SolidChromeElement {
             return Ok(());
         }
         frame.draw_solid(dst, damage, self.color)
+    }
+}
+
+impl<R: Renderer> RenderElement<R> for BorderChromeElement {
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        _src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        if self.color.a() <= 0.0 || dst.size.w <= 0 || dst.size.h <= 0 || damage.is_empty() {
+            return Ok(());
+        }
+        let t = if self.geo.size.h > 0 {
+            ((self.thickness as i32) * dst.size.h / self.geo.size.h).max(1)
+        } else {
+            1
+        };
+        let t = t.min(dst.size.w.max(1) / 2).min(dst.size.h.max(1) / 2);
+        let sides = [
+            Rectangle::new(dst.loc, (dst.size.w, t).into()),
+            Rectangle::new(
+                (dst.loc.x, dst.loc.y + dst.size.h - t).into(),
+                (dst.size.w, t).into(),
+            ),
+            Rectangle::new(
+                (dst.loc.x, dst.loc.y + t).into(),
+                (t, dst.size.h - t * 2).into(),
+            ),
+            Rectangle::new(
+                (dst.loc.x + dst.size.w - t, dst.loc.y + t).into(),
+                (t, dst.size.h - t * 2).into(),
+            ),
+        ];
+        for side in sides {
+            if side.size.w <= 0 || side.size.h <= 0 {
+                continue;
+            }
+            frame.draw_solid(side, damage, self.color)?;
+        }
+        Ok(())
     }
 }
 
@@ -268,6 +379,9 @@ where
             Self::Solid(elem) => {
                 RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
             }
+            Self::Border(elem) => {
+                RenderElement::<R>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
+            }
             Self::Shader(elem) => {
                 let Some(glow_frame) = R::glow_frame_mut(frame) else {
                     return Ok(());
@@ -292,6 +406,7 @@ where
     fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         match self {
             Self::Solid(elem) => elem.underlying_storage(renderer),
+            Self::Border(elem) => elem.underlying_storage(renderer),
             Self::Shader(elem) => {
                 let glow = renderer.glow_renderer_mut()?;
                 elem.underlying_storage(glow)
