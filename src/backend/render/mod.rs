@@ -261,7 +261,7 @@ impl IndicatorShader {
         color: [f32; 3],
     ) -> CosmicChromeElement {
         let Some(shader) = Self::get(renderer) else {
-            return CosmicChromeElement::skip();
+            return CosmicChromeElement::border(geo, thickness, alpha, color);
         };
         let glow = renderer
             .glow_renderer()
