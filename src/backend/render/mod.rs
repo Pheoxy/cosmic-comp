@@ -42,7 +42,8 @@ use crate::{
             corner_radius::{pad_rect, surface_corners, surface_padding},
             data_device::get_dnd_icon,
             image_copy_capture::{
-                CaptureRenderer, FrameHolder, SessionData, render_element_buffers, render_session,
+                CaptureRenderer, CaptureSessionRef, FrameHolder, SessionData, render_element_buffers,
+                render_session,
             },
         },
         protocols::workspace::WorkspaceHandle,
@@ -1480,6 +1481,13 @@ where
                 if let Some(pending_image_copy_data) = render_session(
                     renderer,
                     session.user_data().get::<SessionData>().unwrap(),
+                    CaptureSessionRef::Session(session.clone()),
+                    // This runs on `SurfaceThreadState`'s event loop, not `State`'s, so the
+                    // vulkan SHM-copy deferral (which needs `&mut State`) is unavailable here;
+                    // `false` keeps the original eager/blocking copy for this path. `nodes` is
+                    // only read by that deferred path, so it's unused either way.
+                    None,
+                    false,
                     frame,
                     output.current_transform(),
                     |buffer, renderer, offscreen, dt, age, additional_damage| {

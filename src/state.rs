@@ -738,6 +738,7 @@ impl LockedBackend<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct KmsNodes {
     pub render_node: DrmNode,
     pub target_node: DrmNode,
