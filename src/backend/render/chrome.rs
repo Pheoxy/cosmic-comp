@@ -1,14 +1,15 @@
 //! Renderer-generic compositor chrome.
 //!
 //! Callers construct [`CosmicChromeElement`] and draw it with [`RenderElement<R>`]. Glow/GLES
-//! uses the rounded pixel shader when a glow frame exists. Vulkan, Pixman, and any other
-//! `Frame::draw_solid` renderer get a logical-space solid fill, a four-rect border,
-//! stacked offset fills for shadows, or a no-op. Rounded corners, blur, and gaussian
-//! shadows wait on Vulkan pipelines.
+//! uses the rounded pixel shader when a glow frame exists. Everything else - Vulkan, Pixman, or
+//! any other `Frame`-implementing renderer - gets a logical-space solid fill, a four-rect border,
+//! a shadow via the renderer-generic `Frame::draw_shadow` (a real blurred shader on Vulkan, that
+//! method's own stacked-fill approximation elsewhere), or a no-op.
 
+use glam::{Affine2, Mat3, Vec2};
 use smithay::{
     backend::renderer::{
-        Color32F, Frame, Renderer,
+        Color32F, Frame, Renderer, ShadowParameters,
         element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
         gles::element::PixelShaderElement,
         glow::GlowRenderer,
@@ -29,7 +30,7 @@ use super::element::AsGlowRenderer;
 pub enum CosmicChromeElement {
     Solid(SolidChromeElement),
     Border(BorderChromeElement),
-    Shadow(ShadowFillElement),
+    Shadow(GenericShadowElement),
     Shader(PixelShaderElement),
     Skip(SkipChromeElement),
 }
@@ -58,12 +59,36 @@ impl CosmicChromeElement {
         Self::Skip(SkipChromeElement::new())
     }
 
-    /// Drop-shadow approximation for renderers without the rounded GLES shader.
+    /// Drop shadow for renderers without the rounded GLES shader, via [`Frame::draw_shadow`].
     ///
-    /// Matches the GLES shader's offset/spread/softness extents with stacked fills.
-    /// The window is drawn on top and covers the center.
-    pub fn stacked_shadow(geo: Rectangle<i32, Local>, alpha: f32, dark_mode: bool) -> Self {
-        Self::Shadow(ShadowFillElement::new(geo, alpha, dark_mode))
+    /// Vulkan overrides that with a real blurred, rounded-corner shader; other renderers get the
+    /// method's generic stacked-fill default. Either way this is the single non-GLES shadow path,
+    /// so there is no separate CPU-side approximation to keep in sync with the shader here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shadow(
+        geo: Rectangle<i32, Local>,
+        input_to_geo: Mat3,
+        window_input_to_geo: Mat3,
+        color: [f32; 4],
+        sigma: f32,
+        geo_size: [f32; 2],
+        corner_radius: [f32; 4],
+        window_geo_size: [f32; 2],
+        window_corner_radius: [f32; 4],
+        alpha: f32,
+    ) -> Self {
+        Self::Shadow(GenericShadowElement::new(
+            geo,
+            input_to_geo,
+            window_input_to_geo,
+            color,
+            sigma,
+            geo_size,
+            corner_radius,
+            window_geo_size,
+            window_corner_radius,
+            alpha,
+        ))
     }
 }
 
@@ -108,42 +133,56 @@ impl BorderChromeElement {
     }
 }
 
-/// Offset stacked fills approximating the GLES gaussian drop shadow.
+/// Drop shadow drawn via the renderer-generic [`Frame::draw_shadow`] - a real blurred shader under
+/// Vulkan, a stacked-fill approximation (that method's own default) under everything else.
+///
+/// `input_to_geo`/`window_input_to_geo` are the same `[0, 1]`-normalized-local-space-to-geo-space
+/// matrices the GLES shader path (`ShadowShader::element`) builds; unlike that path, this element
+/// has no vertex-interpolated local coordinate to feed them; `draw` composes them with a
+/// `dst`-derived pixel-to-local mapping at draw time instead (see [`ShadowParameters`]'s docs on
+/// `pixel_to_geo`).
 #[derive(Debug, Clone)]
-pub struct ShadowFillElement {
+pub struct GenericShadowElement {
     id: Id,
     geo: Rectangle<i32, Logical>,
-    layers: Vec<(Rectangle<i32, Logical>, f32)>,
+    input_to_geo: Mat3,
+    window_input_to_geo: Mat3,
+    color: [f32; 4],
+    sigma: f32,
+    geo_size: [f32; 2],
+    corner_radius: [f32; 4],
+    window_geo_size: [f32; 2],
+    window_corner_radius: [f32; 4],
+    alpha: f32,
     commit: CommitCounter,
 }
 
-impl ShadowFillElement {
-    pub fn new(window: Rectangle<i32, Local>, alpha: f32, dark_mode: bool) -> Self {
-        let window = window.as_logical();
-        let base = alpha * if dark_mode { 0.45 } else { 0.35 };
-        // Shader: offset [0, 5], spread 5, softness 25 (sigma 12.5, width ~38).
-        let offset_y = 5;
-        let layers_def = [(40, 0.15), (24, 0.28), (12, 0.50), (6, 0.80)];
-        let mut layers = Vec::with_capacity(layers_def.len());
-        let mut outer = window;
-        for (expand, weight) in layers_def {
-            let geo = Rectangle::new(
-                (window.loc.x - expand, window.loc.y - expand + offset_y).into(),
-                (
-                    window.size.w.saturating_add(expand * 2),
-                    window.size.h.saturating_add(expand * 2),
-                )
-                    .into(),
-            );
-            if geo.size.w >= outer.size.w && geo.size.h >= outer.size.h {
-                outer = geo;
-            }
-            layers.push((geo, (base * weight).clamp(0.0, 1.0)));
-        }
+impl GenericShadowElement {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        geo: Rectangle<i32, Local>,
+        input_to_geo: Mat3,
+        window_input_to_geo: Mat3,
+        color: [f32; 4],
+        sigma: f32,
+        geo_size: [f32; 2],
+        corner_radius: [f32; 4],
+        window_geo_size: [f32; 2],
+        window_corner_radius: [f32; 4],
+        alpha: f32,
+    ) -> Self {
         Self {
             id: Id::new(),
-            geo: outer,
-            layers,
+            geo: geo.as_logical(),
+            input_to_geo,
+            window_input_to_geo,
+            color,
+            sigma,
+            geo_size,
+            corner_radius,
+            window_geo_size,
+            window_corner_radius,
+            alpha,
             commit: CommitCounter::default(),
         }
     }
@@ -220,7 +259,7 @@ impl Element for BorderChromeElement {
     }
 }
 
-impl Element for ShadowFillElement {
+impl Element for GenericShadowElement {
     fn id(&self) -> &Id {
         &self.id
     }
@@ -238,7 +277,7 @@ impl Element for ShadowFillElement {
     }
 
     fn alpha(&self) -> f32 {
-        self.layers.last().map(|(_, a)| *a).unwrap_or(0.0)
+        self.alpha
     }
 
     fn kind(&self) -> Kind {
@@ -435,7 +474,7 @@ impl<R: Renderer> RenderElement<R> for BorderChromeElement {
     }
 }
 
-impl<R: Renderer> RenderElement<R> for ShadowFillElement {
+impl<R: Renderer> RenderElement<R> for GenericShadowElement {
     fn draw(
         &self,
         frame: &mut R::Frame<'_, '_>,
@@ -445,30 +484,35 @@ impl<R: Renderer> RenderElement<R> for ShadowFillElement {
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        if dst.size.w <= 0 || dst.size.h <= 0 || damage.is_empty() {
+        if self.alpha <= 0.0 || dst.size.w <= 0 || dst.size.h <= 0 || damage.is_empty() {
             return Ok(());
         }
-        let sx = dst.size.w as f64 / self.geo.size.w.max(1) as f64;
-        let sy = dst.size.h as f64 / self.geo.size.h.max(1) as f64;
-        for (layer, alpha) in &self.layers {
-            if *alpha <= 0.0 {
-                continue;
-            }
-            let loc = (
-                dst.loc.x + ((layer.loc.x - self.geo.loc.x) as f64 * sx).round() as i32,
-                dst.loc.y + ((layer.loc.y - self.geo.loc.y) as f64 * sy).round() as i32,
-            );
-            let size = (
-                (layer.size.w as f64 * sx).round() as i32,
-                (layer.size.h as f64 * sy).round() as i32,
-            );
-            let rect = Rectangle::new(loc.into(), size.into());
-            if rect.size.w <= 0 || rect.size.h <= 0 {
-                continue;
-            }
-            frame.draw_solid(rect, damage, Color32F::new(0.0, 0.0, 0.0, *alpha))?;
-        }
-        Ok(())
+        // `input_to_geo`/`window_input_to_geo` map a `[0, 1]`-normalized local coordinate (as a
+        // GLES vertex shader would interpolate across this element's own quad) into geo space.
+        // This element has no such vertex-interpolated coordinate, so compose that with a
+        // `dst`-derived mapping from absolute framebuffer pixels to the same `[0, 1]` local space,
+        // giving `Frame::draw_shadow` implementations a direct pixel-to-geo matrix instead.
+        let pixel_to_local = Mat3::from(
+            Affine2::from_scale(Vec2::new(1.0 / dst.size.w as f32, 1.0 / dst.size.h as f32))
+                * Affine2::from_translation(Vec2::new(-dst.loc.x as f32, -dst.loc.y as f32)),
+        );
+        let pixel_to_geo = self.input_to_geo * pixel_to_local;
+        let pixel_to_window_geo = self.window_input_to_geo * pixel_to_local;
+        frame.draw_shadow(
+            dst,
+            damage,
+            ShadowParameters {
+                pixel_to_geo: pixel_to_geo.to_cols_array(),
+                pixel_to_window_geo: pixel_to_window_geo.to_cols_array(),
+                color: self.color,
+                sigma: self.sigma,
+                geo_size: self.geo_size,
+                corner_radius: self.corner_radius,
+                window_geo_size: self.window_geo_size,
+                window_corner_radius: self.window_corner_radius,
+                alpha: self.alpha,
+            },
+        )
     }
 }
 
