@@ -74,7 +74,7 @@ use smithay::{
         },
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, Monotonic, Physical, Point, Rectangle, Scale, Transform},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         image_copy_capture::{
@@ -1381,7 +1381,20 @@ impl SurfaceThreadState {
 
         match res {
             Ok(frame_result) => {
-                let had_cursor = elements.iter().any(|elem| elem.kind() == Kind::Cursor);
+                let output_scale = Scale::from(self.output.current_scale().fractional_scale());
+                let output_geo = Rectangle::from_size(
+                    self.output
+                        .current_mode()
+                        .map(|mode| mode.size)
+                        .unwrap_or_default(),
+                );
+                let had_visible_cursor = elements.iter().any(|elem| {
+                    elem.kind() == Kind::Cursor
+                        && elem
+                            .geometry(output_scale)
+                            .intersection(output_geo)
+                            .is_some_and(|geo| geo.size.w > 0 && geo.size.h > 0)
+                });
                 let hw_cursor = frame_result.cursor_element.is_some();
                 let primary = match &frame_result.primary_element {
                     PrimaryPlaneElement::Swapchain(_) => "composited",
@@ -1393,13 +1406,14 @@ impl SurfaceThreadState {
                     hw_cursor,
                     "kms frame planes"
                 );
-                if had_cursor && !hw_cursor {
+                if had_visible_cursor && !hw_cursor {
                     let now = Instant::now();
                     let should_warn = self
                         .last_cursor_plane_miss
                         .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5));
                     if should_warn {
                         warn!(
+                            flags = ?self.frame_flags,
                             "cursor plane not assigned; pointer composited on primary (software cursor)"
                         );
                         self.last_cursor_plane_miss = Some(now);
