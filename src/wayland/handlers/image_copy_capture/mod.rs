@@ -437,7 +437,24 @@ fn constraints_for_toplevel(
 fn constraints_shm_only(size: Size<i32, BufferCoords>) -> BufferConstraints {
     BufferConstraints {
         size,
-        shm: vec![ShmFormat::Abgr8888, ShmFormat::Xbgr8888],
+        // Vulkan offscreen ExportMem matches the target Fourcc. Advertise
+        // packed 8-bit formats Vulkan can render; keep GLES Abgr first when
+        // glow exists (constraints_for_renderer).
+        shm: {
+            #[cfg(feature = "renderer_vulkan")]
+            {
+                vec![
+                    ShmFormat::Argb8888,
+                    ShmFormat::Xrgb8888,
+                    ShmFormat::Abgr8888,
+                    ShmFormat::Xbgr8888,
+                ]
+            }
+            #[cfg(not(feature = "renderer_vulkan"))]
+            {
+                vec![ShmFormat::Abgr8888, ShmFormat::Xbgr8888]
+            }
+        },
         dma: None,
     }
 }
