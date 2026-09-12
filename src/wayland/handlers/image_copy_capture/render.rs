@@ -32,6 +32,8 @@ use smithay::{
         shm::{shm_format_to_fourcc, with_buffer_contents, with_buffer_contents_mut},
     },
 };
+#[cfg(feature = "renderer_vulkan")]
+use std::{cell::RefCell, rc::Rc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -90,17 +92,205 @@ pub struct PendingImageCopyData {
     // Hold reference so `wl_buffer` isn't released and sync point isn't signaled
     // until image copy completes.
     _buffers: Vec<smithay::backend::renderer::utils::Buffer>,
+    // The GPU->CPU readback for an SHM capture, still to be done once `sync` is reached. `None`
+    // for a direct dmabuf-target render, which needs no separate copy step.
+    #[cfg(feature = "renderer_vulkan")]
+    shm_copy: Option<PendingShmCopy>,
+}
+
+/// The session types `submit_buffer`/`render_session` are called for. Workspace and toplevel
+/// captures use [`SessionRef`]; cursor captures use the separate [`CursorSessionRef`] - both
+/// expose an equivalent `user_data()`/`SessionData`, just as different Rust types.
+#[derive(Clone)]
+pub enum CaptureSessionRef {
+    Session(SessionRef),
+    Cursor(CursorSessionRef),
+}
+
+#[cfg(feature = "renderer_vulkan")]
+impl CaptureSessionRef {
+    fn session_data(&self) -> Option<&SessionData> {
+        match self {
+            Self::Session(session) => session.user_data().get::<SessionData>(),
+            Self::Cursor(session) => session.user_data().get::<SessionData>(),
+        }
+    }
+}
+
+/// Work still needed to complete an SHM capture: `submit_buffer` renders into the session's
+/// offscreen target but does not wait for or copy out of it (that would block the compositor's
+/// single event-loop thread on every capture poll). This carries what a later, fence-driven
+/// completion needs to redo the same bind and finish the copy: the exact renderer selection used
+/// for the render (so the readback happens on the same device), and the session/destination
+/// buffer to copy into.
+#[cfg(feature = "renderer_vulkan")]
+struct PendingShmCopy {
+    session: CaptureSessionRef,
+    nodes: Option<KmsNodes>,
+    buffer: WlBuffer,
+    buffer_size: Size<i32, BufferCoords>,
+}
+
+/// Finish a deferred SHM capture: re-bind the session's offscreen target on the same renderer
+/// used to render it, copy out, and write into the client's buffer.
+///
+/// Must only be called once `sync` for the render has already been reached - this does not wait.
+#[cfg(feature = "renderer_vulkan")]
+fn finish_shm_copy(state: &mut State, shm_copy: &PendingShmCopy) -> Result<(), CaptureFailureReason> {
+    let Some(session_data) = shm_copy.session.session_data() else {
+        return Err(CaptureFailureReason::Unknown);
+    };
+    let mut session_user_data = session_data.lock().unwrap();
+    session_user_data.copy_pending = false;
+    let Some(target) = session_user_data.offscreen.as_mut() else {
+        return Err(CaptureFailureReason::Unknown);
+    };
+
+    let nodes = shm_copy.nodes;
+    let renderer = state
+        .backend
+        .offscreen_renderer(move |_| nodes)
+        .map_err(|_| CaptureFailureReason::Unknown)?;
+
+    // Each `RendererRef` arm is a different concrete renderer type with its own `Error`, so
+    // normalize to `CaptureFailureReason` inside the match instead of returning `R::Error` from
+    // it - the two arms would otherwise be different, non-unifiable `Result` types.
+    let result: Result<(), CaptureFailureReason> = match renderer {
+        RendererRef::Glow(r) => {
+            copy_shm_target(r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
+                warn!(?err, "Failed to finish deferred SHM capture");
+                CaptureFailureReason::Unknown
+            })
+        }
+        RendererRef::GlMulti(mut r) => {
+            copy_shm_target(&mut r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
+                warn!(?err, "Failed to finish deferred SHM capture");
+                CaptureFailureReason::Unknown
+            })
+        }
+    };
+
+    // `session_user_data` still borrows `target`; drop it explicitly so the borrow ends here,
+    // not just at end of scope, in case a future change adds code after this point that needs
+    // the session lock again.
+    drop(session_user_data);
+
+    result
+}
+
+/// Re-bind `target` on `renderer`, copy it out, and memcpy the result into `buffer`.
+#[cfg(feature = "renderer_vulkan")]
+fn copy_shm_target<R>(
+    renderer: &mut R,
+    target: &mut VulkanRenderTarget<'static>,
+    buffer: &WlBuffer,
+    buffer_size: Size<i32, BufferCoords>,
+) -> Result<(), R::Error>
+where
+    R: CaptureRenderer + ExportMem,
+{
+    let fb = renderer.bind_shm_offscreen(target)?;
+    with_buffer_contents_mut(buffer, |ptr, len, data| {
+        let offset = data.offset;
+        let width = data.width;
+        let height = data.height;
+        let stride = data.stride;
+        let format = shm_format_to_fourcc(data.format)
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+        let pixelsize = 4i32;
+        assert!((offset + (height - 1) * stride + width * pixelsize) as usize <= len);
+
+        let mapping = renderer.copy_framebuffer(&fb, Rectangle::from_size(buffer_size), format)?;
+        let gl_data = renderer.map_texture(&mapping)?;
+        assert!((width * height * pixelsize) as usize <= gl_data.len());
+
+        for i in 0..height {
+            unsafe {
+                std::ptr::copy_nonoverlapping::<u8>(
+                    gl_data.as_ptr().offset((width * pixelsize * i) as isize),
+                    ptr.offset((offset + stride * i) as isize),
+                    (width * pixelsize) as usize,
+                );
+            }
+        }
+
+        Ok(())
+    })
+    .map_err(|err| R::from_gles_error(GlesError::BufferAccessError(err)))
+    .and_then(|x: Result<(), R::Error>| x)?;
+    drop(fb);
+    Ok(())
+}
+
+/// Bundle handed between the fd/timeout/idle sources racing to complete one deferred SHM copy.
+/// Whichever fires first `take()`s it; the rest find `None` and no-op.
+#[cfg(feature = "renderer_vulkan")]
+type PendingShmCopyBundle = (
+    Frame,
+    Vec<smithay::utils::Rectangle<i32, BufferCoords>>,
+    PendingShmCopy,
+    Vec<smithay::backend::renderer::utils::Buffer>,
+);
+
+#[cfg(feature = "renderer_vulkan")]
+fn run_pending_shm_copy(
+    bundle: &Rc<RefCell<Option<PendingShmCopyBundle>>>,
+    state: &mut State,
+    transform: Transform,
+    presented: Duration,
+    timed_out: bool,
+) {
+    let Some((frame, damage, shm_copy, _buffers)) = bundle.borrow_mut().take() else {
+        return;
+    };
+    if timed_out {
+        warn!("Timed out waiting on SHM capture render fence");
+        if let Some(session_data) = shm_copy.session.session_data() {
+            session_data.lock().unwrap().copy_pending = false;
+        }
+        frame.fail(CaptureFailureReason::Unknown);
+        return;
+    }
+    match finish_shm_copy(state, &shm_copy) {
+        Ok(()) => frame.success(transform, damage, presented),
+        Err(reason) => frame.fail(reason),
+    }
+    // `_buffers` (the render's source wl_buffers) drops here, after the copy has actually read
+    // from the offscreen target they were drawn into.
 }
 
 impl PendingImageCopyData {
-    /// Send `success` to image copy frame, once sync point is reached
-    pub fn send_success_when_ready<LoopData>(
+    /// Send `success` to image copy frame, once sync point is reached.
+    ///
+    /// Generic over `LoopData` because callers run on different event loops: workspace/window/
+    /// cursor captures run on the compositor's main `State` loop, output-based captures run on a
+    /// per-surface `SurfaceThreadState` loop. `self.shm_copy` (vulkan only) is only ever `Some`
+    /// when `submit_buffer` was told (`defer_shm_copy: true`) that this call site uses `State` -
+    /// every such call site in this codebase does - so the downcast below always succeeds in
+    /// practice; it exists to fail closed instead of panicking if that invariant is ever violated.
+    pub fn send_success_when_ready<LoopData: 'static>(
         self,
         transform: Transform,
         loop_handle: &LoopHandle<'static, LoopData>,
         presented: impl Into<Duration>,
     ) {
         let presented = presented.into();
+
+        #[cfg(feature = "renderer_vulkan")]
+        if self.shm_copy.is_some() {
+            let loop_handle_any: &dyn std::any::Any = loop_handle;
+            return match loop_handle_any.downcast_ref::<LoopHandle<'static, State>>() {
+                Some(state_loop_handle) => self.finish_deferred(transform, state_loop_handle, presented),
+                None => {
+                    warn!(
+                        "SHM capture was deferred for a non-`State` event loop; failing instead of \
+                         skipping the copy"
+                    );
+                    self.frame.fail(CaptureFailureReason::Unknown);
+                }
+            };
+        }
+
         if self.sync.is_reached() {
             self.frame.success(transform, self.damage, presented);
         } else if let Some(fence_fd) = self.sync.export() {
@@ -111,7 +301,7 @@ impl PendingImageCopyData {
             );
             let mut data = Some(self);
             loop_handle
-                .insert_source(source, move |_, _, _| {
+                .insert_source(source, move |_, _, _: &mut LoopData| {
                     let data = data.take().unwrap();
                     data.frame.success(transform, data.damage, presented);
                     Ok(calloop::PostAction::Remove)
@@ -123,6 +313,71 @@ impl PendingImageCopyData {
             self.frame.success(transform, self.damage, presented);
         }
     }
+
+    /// Complete an SHM capture once its render's sync point is reached, or fail it if that never
+    /// happens within a safety-net timeout (a hung/lost-device fence would otherwise leave the fd
+    /// source registered forever with the client's capture request never answered).
+    ///
+    /// `finish_shm_copy` needs `&mut State` (to re-derive the renderer), which this method does
+    /// not have - only calloop callbacks do - so even the already-reached case is finished via
+    /// `insert_idle` rather than called inline.
+    #[cfg(feature = "renderer_vulkan")]
+    fn finish_deferred(
+        self,
+        transform: Transform,
+        loop_handle: &LoopHandle<'static, State>,
+        presented: Duration,
+    ) {
+        let PendingImageCopyData {
+            frame,
+            damage,
+            sync,
+            _buffers,
+            shm_copy,
+        } = self;
+        let shm_copy = shm_copy.expect("checked by caller");
+
+        let bundle: Rc<RefCell<Option<PendingShmCopyBundle>>> =
+            Rc::new(RefCell::new(Some((frame, damage, shm_copy, _buffers))));
+
+        if sync.is_reached() {
+            let bundle = bundle.clone();
+            let _ = loop_handle
+                .insert_idle(move |state| run_pending_shm_copy(&bundle, state, transform, presented, false));
+            return;
+        }
+
+        let Some(fence_fd) = sync.export() else {
+            // No exportable fence: fall back to a blocking wait, same as the non-SHM path.
+            let _ = sync.wait();
+            let bundle = bundle.clone();
+            let _ = loop_handle
+                .insert_idle(move |state| run_pending_shm_copy(&bundle, state, transform, presented, false));
+            return;
+        };
+
+        let source =
+            calloop::generic::Generic::new(fence_fd, calloop::Interest::READ, calloop::Mode::OneShot);
+        {
+            let bundle = bundle.clone();
+            loop_handle
+                .insert_source(source, move |_, _, state: &mut State| {
+                    run_pending_shm_copy(&bundle, state, transform, presented, false);
+                    Ok(calloop::PostAction::Remove)
+                })
+                .expect("Failed to wait on sync point");
+        }
+
+        // Safety-net timeout: if the fence never signals (device lost, driver bug), fail the
+        // frame instead of leaving the client's capture request hanging forever.
+        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(2));
+        loop_handle
+            .insert_source(timer, move |_, _, state: &mut State| {
+                run_pending_shm_copy(&bundle, state, transform, presented, true);
+                calloop::timer::TimeoutAction::Drop
+            })
+            .expect("Failed to arm SHM capture timeout");
+    }
 }
 
 pub fn submit_buffer<R>(
@@ -131,12 +386,22 @@ pub fn submit_buffer<R>(
     offscreen: Option<&mut R::Framebuffer<'_>>,
     transform: Transform,
     damage: Option<&[Rectangle<i32, Physical>]>,
-    mut sync: SyncPoint,
+    sync: SyncPoint,
     buffers: Vec<smithay::backend::renderer::utils::Buffer>,
+    session_ref: CaptureSessionRef,
+    nodes: Option<KmsNodes>,
+    // Only the workspace/window/cursor capture paths run on the `State`-based event loop the
+    // deferred completion (`send_success_when_ready`'s vulkan branch) needs; output-based capture
+    // runs on a per-surface `SurfaceThreadState` loop that can't provide it, so that caller passes
+    // `false` here and keeps the original eager (blocking) copy for the vulkan SHM case too.
+    defer_shm_copy: bool,
 ) -> Result<Option<PendingImageCopyData>, R::Error>
 where
     R: ExportMem + AsGlowRenderer,
 {
+    let _ = &session_ref;
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let _ = (nodes, defer_shm_copy);
     let Some(damage) = damage else {
         frame.success(
             transform,
@@ -151,6 +416,78 @@ where
     let buffer = frame.buffer();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
 
+    #[cfg(feature = "renderer_vulkan")]
+    let mut shm_copy = None;
+    #[cfg(feature = "renderer_vulkan")]
+    let mut sync = sync;
+
+    #[cfg(feature = "renderer_vulkan")]
+    if let Some(fb) = offscreen {
+        assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
+        if defer_shm_copy {
+            // Validate the destination buffer now so a protocol violation fails fast; the actual
+            // GPU->CPU copy is deferred until `sync` is reached (`send_success_when_ready`)
+            // instead of blocking this render dispatch on the compositor's event-loop thread.
+            if let Err(err) = with_buffer_contents(&buffer, |_, len, data| {
+                let offset = data.offset;
+                let width = data.width;
+                let height = data.height;
+                let stride = data.stride;
+                let pixelsize = 4i32;
+                assert!((offset + (height - 1) * stride + width * pixelsize) as usize <= len);
+                let _ = shm_format_to_fourcc(data.format)
+                    .expect("We should be able to convert all hardcoded shm screencopy formats");
+            }) {
+                frame.fail(CaptureFailureReason::Unknown);
+                return Err(R::from_gles_error(GlesError::BufferAccessError(err)));
+            }
+            shm_copy = Some(PendingShmCopy {
+                session: session_ref.clone(),
+                nodes,
+                buffer: buffer.clone(),
+                buffer_size,
+            });
+        } else if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
+            let offset = data.offset;
+            let width = data.width;
+            let height = data.height;
+            let stride = data.stride;
+            let format = shm_format_to_fourcc(data.format)
+                .expect("We should be able to convert all hardcoded shm screencopy formats");
+            let pixelsize = 4i32;
+            assert!((offset + (height - 1) * stride + width * pixelsize) as usize <= len);
+
+            renderer.wait(&sync)?;
+
+            let mapping = renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), format)?;
+            let gl_data = renderer.map_texture(&mapping)?;
+            assert!((width * height * pixelsize) as usize <= gl_data.len());
+
+            for i in 0..height {
+                unsafe {
+                    std::ptr::copy_nonoverlapping::<u8>(
+                        gl_data.as_ptr().offset((width * pixelsize * i) as isize),
+                        ptr.offset((offset + stride * i) as isize),
+                        (width * pixelsize) as usize,
+                    );
+                }
+            }
+
+            sync = SyncPoint::signaled();
+
+            Ok(())
+        })
+        .map_err(|err| R::from_gles_error(GlesError::BufferAccessError(err)))
+        .and_then(|x| x)
+        {
+            frame.fail(CaptureFailureReason::Unknown);
+            return Err(err);
+        }
+    }
+
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let mut sync = sync;
+    #[cfg(not(feature = "renderer_vulkan"))]
     if let Some(fb) = offscreen {
         assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
         if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
@@ -171,18 +508,7 @@ where
             // ensure rendering is done
             renderer.wait(&sync)?;
 
-            // VulkanRenderer::copy_framebuffer requires format == offscreen
-            // target Fourcc (Abgr8888 here). GLES may remap via get_transparent.
-            let copy_format = {
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    format
-                }
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    get_transparent(format).unwrap_or(format)
-                }
-            };
+            let copy_format = get_transparent(format).unwrap_or(format);
             let mapping =
                 renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), copy_format)?;
             let gl_data = renderer.map_texture(&mapping)?;
@@ -199,7 +525,6 @@ where
             }
 
             // We've already waited on the sync point and copied from the texture
-            // TODO: Don't block in this function, and defer copy until ready?
             sync = SyncPoint::signaled();
 
             Ok(())
@@ -223,6 +548,8 @@ where
             .collect(),
         sync,
         _buffers: buffers,
+        #[cfg(feature = "renderer_vulkan")]
+        shm_copy,
     }))
 }
 
@@ -307,6 +634,10 @@ impl CaptureRenderer for smithay::backend::renderer::glow::GlowRenderer {
 pub fn render_session<F, R>(
     renderer: &mut R,
     session: &SessionData,
+    session_ref: CaptureSessionRef,
+    nodes: Option<KmsNodes>,
+    // See `submit_buffer`'s doc on this parameter.
+    defer_shm_copy: bool,
     frame: Frame,
     transform: Transform,
     render_fn: F,
@@ -329,6 +660,16 @@ where
     >,
 {
     let mut session_user_data = session.lock().unwrap();
+
+    // A previous capture on this session already rendered into `offscreen` and is waiting on its
+    // fence before its deferred copy runs (see `PendingShmCopy`); re-rendering now would clobber
+    // the contents that copy still expects. Fail this request rather than race it.
+    #[cfg(feature = "renderer_vulkan")]
+    if session_user_data.copy_pending {
+        drop(session_user_data);
+        frame.fail(CaptureFailureReason::Unknown);
+        return Ok(None);
+    }
 
     let buffer = frame.buffer();
 
@@ -381,7 +722,14 @@ where
         session_user_data.offscreen = None;
     }
 
+    #[cfg(not(feature = "renderer_vulkan"))]
     let SessionUserData { dt, offscreen } = &mut *session_user_data;
+    #[cfg(feature = "renderer_vulkan")]
+    let SessionUserData {
+        dt,
+        offscreen,
+        copy_pending,
+    } = &mut *session_user_data;
     #[cfg(not(feature = "renderer_vulkan"))]
     let mut fb = offscreen
         .as_mut()
@@ -406,7 +754,7 @@ where
         frame.damage(),
     )?;
 
-    submit_buffer(
+    let pending = submit_buffer(
         frame,
         renderer,
         fb.as_mut(),
@@ -414,8 +762,20 @@ where
         result.damage.map(|x| x.as_slice()),
         result.sync,
         buffers,
+        session_ref,
+        nodes,
+        defer_shm_copy,
     )
-    .map_err(DTError::Rendering)
+    .map_err(DTError::Rendering)?;
+
+    #[cfg(feature = "renderer_vulkan")]
+    if let Some(p) = &pending {
+        if p.shm_copy.is_some() {
+            *copy_pending = true;
+        }
+    }
+
+    Ok(pending)
 }
 
 pub fn render_workspace_to_buffer(
@@ -557,6 +917,8 @@ pub fn render_workspace_to_buffer(
     let transform = output.current_transform();
     let common = &mut state.common;
 
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
     let renderer = match state.backend.offscreen_renderer(|kms| {
         let render_node = kms
             .target_node_for_output(&output)
@@ -575,11 +937,14 @@ pub fn render_workspace_to_buffer(
             _ => None,
         };
 
-        Some(KmsNodes {
+        let nodes = KmsNodes {
             render_node,
             target_node,
             copy_format: buffer_format.unwrap_or(Fourcc::Abgr8888),
-        })
+        };
+        #[cfg(feature = "renderer_vulkan")]
+        nodes_cell.set(Some(nodes));
+        Some(nodes)
     }) {
         Ok(renderer) => renderer,
         Err(err) => {
@@ -588,12 +953,19 @@ pub fn render_workspace_to_buffer(
             return;
         }
     };
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes = nodes_cell.get();
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
         #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
                 session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Session(session.clone()),
+                nodes,
+                true,
                 frame,
                 transform,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {
@@ -627,6 +999,9 @@ pub fn render_workspace_to_buffer(
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Session(session.clone()),
+                nodes,
+                true,
                 frame,
                 transform,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {
@@ -841,8 +1216,10 @@ pub fn render_window_to_buffer(
     let common = &mut state.common;
     let draw_cursor = session.draw_cursor();
 
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
     let renderer = match state.backend.offscreen_renderer(|kms| {
-        get_dmabuf(&buffer)
+        let node = get_dmabuf(&buffer)
             .ok()
             .and_then(|dmabuf| dmabuf.node())
             .or_else(|| {
@@ -857,7 +1234,10 @@ pub fn render_window_to_buffer(
                     })
                     .flatten()
             })
-            .or(*kms.primary_node.read().unwrap())
+            .or(*kms.primary_node.read().unwrap());
+        #[cfg(feature = "renderer_vulkan")]
+        nodes_cell.set(node.map(KmsNodes::from));
+        node
     }) {
         Ok(renderer) => renderer,
         Err(err) => {
@@ -866,11 +1246,18 @@ pub fn render_window_to_buffer(
             return;
         }
     };
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes = nodes_cell.get();
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
         #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => match render_session(
             renderer,
             session.user_data().get::<SessionData>().unwrap(),
+            CaptureSessionRef::Session(session.clone()),
+            nodes,
+            true,
             frame,
             Transform::Normal,
             |buffer, renderer, offscreen, dt, age, additional_damage| {
@@ -902,6 +1289,9 @@ pub fn render_window_to_buffer(
         RendererRef::GlMulti(mut renderer) => match render_session(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
+            CaptureSessionRef::Session(session.clone()),
+            nodes,
+            true,
             frame,
             Transform::Normal,
             |buffer, renderer, offscreen, dt, age, additional_damage| {
@@ -1027,10 +1417,14 @@ pub fn render_cursor_to_buffer(
     }
 
     let common = &mut state.common;
-    let renderer = match state
-        .backend
-        .offscreen_renderer(|kms| *kms.primary_node.read().unwrap())
-    {
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
+    let renderer = match state.backend.offscreen_renderer(|kms| {
+        let node = *kms.primary_node.read().unwrap();
+        #[cfg(feature = "renderer_vulkan")]
+        nodes_cell.set(node.map(KmsNodes::from));
+        node
+    }) {
         Ok(renderer) => renderer,
         Err(err) => {
             warn!(?err, "Couldn't use node for screencopy");
@@ -1038,12 +1432,19 @@ pub fn render_cursor_to_buffer(
             return;
         }
     };
+    #[cfg(feature = "renderer_vulkan")]
+    let nodes = nodes_cell.get();
+    #[cfg(not(feature = "renderer_vulkan"))]
+    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
         #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
                 session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Cursor(session.clone()),
+                nodes,
+                true,
                 frame,
                 Transform::Normal,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {
@@ -1075,6 +1476,9 @@ pub fn render_cursor_to_buffer(
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Cursor(session.clone()),
+                nodes,
+                true,
                 frame,
                 Transform::Normal,
                 |buffer, renderer, offscreen, dt, age, additional_damage| {

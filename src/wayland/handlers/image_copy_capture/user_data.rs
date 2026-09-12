@@ -32,6 +32,12 @@ pub struct SessionUserData {
     pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
     #[cfg(feature = "renderer_vulkan")]
     pub offscreen: Option<VulkanRenderTarget<'static>>,
+    /// An SHM readback for `offscreen` has been rendered and is waiting on its fence before the
+    /// copy into the client buffer runs (see `render::PendingShmCopy`). While this is set, a new
+    /// capture request must not re-render into `offscreen`, since the pending copy still expects
+    /// this frame's contents. Reset once that copy (or its failure/timeout) completes.
+    #[cfg(feature = "renderer_vulkan")]
+    pub copy_pending: bool,
 }
 
 impl SessionUserData {
@@ -39,6 +45,8 @@ impl SessionUserData {
         SessionUserData {
             dt: tracker,
             offscreen: None,
+            #[cfg(feature = "renderer_vulkan")]
+            copy_pending: false,
         }
     }
 }
