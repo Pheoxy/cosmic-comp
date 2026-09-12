@@ -27,6 +27,7 @@ pub type SessionData = Mutex<SessionUserData>;
 
 pub struct SessionUserData {
     pub dt: OutputDamageTracker,
+    /// Offscreen buffer type of the KMS renderer (`Offscreen::create_buffer`).
     #[cfg(not(feature = "renderer_vulkan"))]
     pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
     #[cfg(feature = "renderer_vulkan")]

@@ -14,7 +14,7 @@ use smithay::{
         allocator::dmabuf::Dmabuf,
         drm::DrmDeviceFd,
         renderer::{
-            Bind, Blit, ContextId, ExportMem, ImportAll, ImportMem, Offscreen, Renderer,
+            Bind, Blit, ContextId, ExportMem, ImportAll, ImportMem, Renderer,
             element::{
                 Element, Id, Kind, RenderElement, UnderlyingStorage,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
@@ -418,23 +418,6 @@ pub trait AsGlowRenderer: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dm
         context: &ContextId<GlesTexture>,
         texture: &Self::TextureId,
     ) -> Option<GlesTexture>;
-
-    #[cfg(feature = "renderer_vulkan")]
-    fn create_vulkan_capture_target(
-        &mut self,
-        _format: smithay::backend::allocator::Fourcc,
-        _size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>, Self::Error> {
-        Err(Self::from_gles_error(GlesError::UnknownPixelFormat))
-    }
-
-    #[cfg(feature = "renderer_vulkan")]
-    fn bind_vulkan_capture_target<'a>(
-        &mut self,
-        _target: &'a mut smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>,
-    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        Err(Self::from_gles_error(GlesError::UnknownPixelFormat))
-    }
 }
 
 impl AsGlowRenderer for GlowRenderer {
@@ -516,21 +499,6 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
     ) -> Option<GlesTexture> {
         None
     }
-    fn create_vulkan_capture_target(
-        &mut self,
-        format: smithay::backend::allocator::Fourcc,
-        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>, Self::Error> {
-        Offscreen::<smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>>::create_buffer(
-            self, format, size,
-        )
-    }
-    fn bind_vulkan_capture_target<'a>(
-        &mut self,
-        target: &'a mut smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>,
-    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        Bind::bind(self, target)
-    }
 }
 
 #[cfg(feature = "renderer_vulkan")]
@@ -546,21 +514,6 @@ impl AsGlowRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
         _texture: &Self::TextureId,
     ) -> Option<GlesTexture> {
         None
-    }
-    fn create_vulkan_capture_target(
-        &mut self,
-        format: smithay::backend::allocator::Fourcc,
-        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>, Self::Error> {
-        Offscreen::<smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>>::create_buffer(
-            self, format, size,
-        )
-    }
-    fn bind_vulkan_capture_target<'a>(
-        &mut self,
-        target: &'a mut smithay::backend::renderer::vulkan::VulkanRenderTarget<'static>,
-    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        Bind::bind(self, target)
     }
 }
 
