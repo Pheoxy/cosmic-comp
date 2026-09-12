@@ -42,7 +42,7 @@ use crate::{
             corner_radius::{pad_rect, surface_corners, surface_padding},
             data_device::get_dnd_icon,
             image_copy_capture::{
-                FrameHolder, SessionData, render_element_buffers, render_session,
+                CaptureRenderer, FrameHolder, SessionData, render_element_buffers, render_session,
             },
         },
         protocols::workspace::WorkspaceHandle,
@@ -1285,7 +1285,7 @@ pub fn render_output<'d, R>(
     loop_handle: &calloop::LoopHandle<'static, State>,
 ) -> Result<RenderOutputResult<'d>, RenderError<R::Error>>
 where
-    R: AsGlowRenderer + Blit,
+    R: AsGlowRenderer + Blit + CaptureRenderer,
     R::TextureId: Send + Clone + 'static,
     CosmicElement<R>: RenderElement<R>,
     CosmicMappedRenderElement<R>: RenderElement<R>,

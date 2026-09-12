@@ -1100,10 +1100,10 @@ impl SurfaceThreadState {
         };
 
         if has_active_fullscreen || animations_going {
-            // Overlay planes are for steady client dmabufs (video/fullscreen), not for
-            // transforming windows. KWin skips overlays while effects run; atomic TESTs
-            // are slow and have frozen some AMD/NVIDIA commits. Do not clear
-            // ALLOW_CURSOR_PLANE_SCANOUT here — that is the hardware pointer, not an overlay.
+            // Overlay assignment is for static client dmabufs. During window
+            // or workspace animation the elements are transforming, so keep
+            // them on primary. Cursor plane is ALLOW_CURSOR_PLANE_SCANOUT,
+            // a different flag — do not clear it here.
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
         }
 

@@ -3,9 +3,10 @@
 use calloop::LoopHandle;
 use smithay::{
     backend::{
-        allocator::{Buffer, Fourcc, format::get_transparent},
+        allocator::{Buffer, Fourcc},
         renderer::{
-            BufferType, Color32F, ExportMem, ImportAll, ImportMem, buffer_dimensions, buffer_type,
+            Bind, BufferType, Color32F, ExportMem, ImportAll, ImportMem, Offscreen,
+            buffer_dimensions, buffer_type,
             damage::{Error as DTError, OutputDamageTracker, RenderOutputResult},
             element::{
                 RenderElement, UnderlyingStorage,
@@ -35,7 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 #[cfg(not(feature = "renderer_vulkan"))]
-use smithay::backend::renderer::{Offscreen, gles::GlesRenderbuffer};
+use smithay::backend::allocator::format::get_transparent;
+#[cfg(not(feature = "renderer_vulkan"))]
+use smithay::backend::renderer::gles::GlesRenderbuffer;
 
 use crate::{
     backend::render::{
@@ -61,7 +64,7 @@ use super::{
 };
 
 #[cfg(feature = "renderer_vulkan")]
-use smithay::backend::renderer::Texture;
+use smithay::backend::renderer::{Texture, vulkan::VulkanRenderTarget};
 
 pub fn render_element_buffers<R, E>(
     renderer: &mut R,
@@ -168,10 +171,11 @@ where
             // ensure rendering is done
             renderer.wait(&sync)?;
 
+            // VulkanRenderer::copy_framebuffer requires format == offscreen
+            // target Fourcc (Abgr8888 here). GLES may remap via get_transparent.
             let copy_format = {
                 #[cfg(feature = "renderer_vulkan")]
                 {
-                    let _ = get_transparent(format);
                     format
                 }
                 #[cfg(not(feature = "renderer_vulkan"))]
@@ -222,6 +226,84 @@ where
     }))
 }
 
+/// SHM capture offscreen. GLES uses Glow `Offscreen<GlesRenderbuffer>` via
+/// [`AsGlowRenderer`]. Vulkan uses smithay [`Offscreen`] / [`Bind`] of
+/// [`VulkanRenderTarget`] on the KMS/winit-vulkan renderer. Nested GLES
+/// (`GlowRenderer`) under `renderer_vulkan` cannot create that target.
+#[cfg(not(feature = "renderer_vulkan"))]
+pub trait CaptureRenderer: AsGlowRenderer {}
+#[cfg(not(feature = "renderer_vulkan"))]
+impl<R: AsGlowRenderer> CaptureRenderer for R {}
+
+#[cfg(feature = "renderer_vulkan")]
+pub trait CaptureRenderer: AsGlowRenderer {
+    fn create_shm_offscreen(
+        &mut self,
+        format: smithay::backend::allocator::Fourcc,
+        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<VulkanRenderTarget<'static>, Self::Error>;
+
+    fn bind_shm_offscreen<'a>(
+        &mut self,
+        target: &'a mut VulkanRenderTarget<'static>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error>;
+}
+
+#[cfg(feature = "renderer_vulkan")]
+impl CaptureRenderer for crate::backend::render::GlMultiRenderer<'_> {
+    fn create_shm_offscreen(
+        &mut self,
+        format: smithay::backend::allocator::Fourcc,
+        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(self, format, size)
+    }
+    fn bind_shm_offscreen<'a>(
+        &mut self,
+        target: &'a mut VulkanRenderTarget<'static>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+}
+
+#[cfg(feature = "renderer_vulkan")]
+impl CaptureRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
+    fn create_shm_offscreen(
+        &mut self,
+        format: smithay::backend::allocator::Fourcc,
+        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(self, format, size)
+    }
+    fn bind_shm_offscreen<'a>(
+        &mut self,
+        target: &'a mut VulkanRenderTarget<'static>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        self.bind(target)
+    }
+}
+
+#[cfg(feature = "renderer_vulkan")]
+impl CaptureRenderer for smithay::backend::renderer::glow::GlowRenderer {
+    fn create_shm_offscreen(
+        &mut self,
+        _format: smithay::backend::allocator::Fourcc,
+        _size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
+        Err(Self::from_gles_error(
+            smithay::backend::renderer::gles::GlesError::UnknownPixelFormat,
+        ))
+    }
+    fn bind_shm_offscreen<'a>(
+        &mut self,
+        _target: &'a mut VulkanRenderTarget<'static>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        Err(Self::from_gles_error(
+            smithay::backend::renderer::gles::GlesError::UnknownPixelFormat,
+        ))
+    }
+}
+
 pub fn render_session<F, R>(
     renderer: &mut R,
     session: &SessionData,
@@ -230,7 +312,7 @@ pub fn render_session<F, R>(
     render_fn: F,
 ) -> Result<Option<PendingImageCopyData>, DTError<R::Error>>
 where
-    R: AsGlowRenderer,
+    R: CaptureRenderer,
     F: for<'d> FnOnce(
         &WlBuffer,
         &mut R,
@@ -287,7 +369,7 @@ where
 
             if session_user_data.offscreen.is_none() {
                 let target = renderer
-                    .create_vulkan_capture_target(format, size)
+                    .create_shm_offscreen(format, size)
                     .map_err(DTError::Rendering)?;
                 session_user_data.offscreen = Some(target);
                 age = 0;
@@ -309,7 +391,7 @@ where
     let mut fb = if let Some(target) = offscreen.as_mut() {
         Some(
             renderer
-                .bind_vulkan_capture_target(target)
+                .bind_shm_offscreen(target)
                 .map_err(DTError::Rendering)?,
         )
     } else {
