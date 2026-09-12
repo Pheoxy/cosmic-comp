@@ -13,11 +13,6 @@
     rust.inputs.nixpkgs.follows = "nixpkgs";
 
     nix-filter.url = "github:numtide/nix-filter";
-
-    # VulkanRenderer smithay (e3d461a pin). flake=false: we vendor the source
-    # into cosmic-comp. The NixOS overlay lives in that tree.
-    smithay-vulkan.url = "github:Pheoxy/smithay/add-vulkan-renderer-support-cosmic-e3d461a";
-    smithay-vulkan.flake = false;
   };
 
   outputs =
@@ -28,7 +23,6 @@
       crane,
       rust,
       nix-filter,
-      smithay-vulkan,
       ...
     }:
     parts.lib.mkFlake { inherit inputs; } {
@@ -36,25 +30,6 @@
         "aarch64-linux"
         "x86_64-linux"
       ];
-
-      flake =
-        let
-          overlayFn = import (smithay-vulkan + "/nix/overlay.nix") {
-            cosmic-comp = self;
-            smithay = smithay-vulkan;
-          };
-          overlay = overlayFn { };
-        in
-        {
-          overlays.cosmic-vulkan = overlayFn;
-          overlays.default = overlay;
-          nixosModules.cosmic-vulkan = import (smithay-vulkan + "/nix/module.nix") {
-            inherit overlay;
-          };
-          nixosModules.default = import (smithay-vulkan + "/nix/module.nix") {
-            inherit overlay;
-          };
-        };
 
       perSystem =
         {
@@ -136,8 +111,6 @@
             # include build inputs
             inputsFrom = [ cosmic-comp ];
           };
-
-          devShells.profiling = import (smithay-vulkan + "/nix/profiling-shell.nix") { inherit pkgs; };
         };
     };
 }
