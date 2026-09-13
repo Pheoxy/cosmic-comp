@@ -105,16 +105,16 @@ use crate::backend::kms::render::{GlesMultiRenderer, VulkanMultiRenderer};
 /// old single compile-time `GlMultiRenderer`/`KmsGraphics` alias.
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
-    GlMultiGles(GlesMultiRenderer<'a>),
-    GlMultiVulkan(VulkanMultiRenderer<'a>),
+    MultiGles(GlesMultiRenderer<'a>),
+    MultiVulkan(VulkanMultiRenderer<'a>),
 }
 
 impl RendererRef<'_> {
     pub fn glow_renderer(&mut self) -> Option<&mut GlowRenderer> {
         match self {
             Self::Glow(renderer) => Some(renderer),
-            Self::GlMultiGles(renderer) => Some(renderer.as_mut()),
-            Self::GlMultiVulkan(_) => None,
+            Self::MultiGles(renderer) => Some(renderer.as_mut()),
+            Self::MultiVulkan(_) => None,
         }
     }
 }

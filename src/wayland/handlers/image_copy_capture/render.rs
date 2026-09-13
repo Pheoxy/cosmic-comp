@@ -156,13 +156,13 @@ fn finish_shm_copy(state: &mut State, shm_copy: &PendingShmCopy) -> Result<(), C
                 CaptureFailureReason::Unknown
             })
         }
-        RendererRef::GlMultiGles(mut r) => {
+        RendererRef::MultiGles(mut r) => {
             copy_shm_target(&mut r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
                 warn!(?err, "Failed to finish deferred SHM capture");
                 CaptureFailureReason::Unknown
             })
         }
-        RendererRef::GlMultiVulkan(mut r) => {
+        RendererRef::MultiVulkan(mut r) => {
             copy_shm_target(&mut r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
                 warn!(?err, "Failed to finish deferred SHM capture");
                 CaptureFailureReason::Unknown
@@ -930,7 +930,7 @@ pub fn render_workspace_to_buffer(
                 }
             }
         }
-        RendererRef::GlMultiGles(mut renderer) => {
+        RendererRef::MultiGles(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
@@ -961,7 +961,7 @@ pub fn render_workspace_to_buffer(
                 }
             }
         }
-        RendererRef::GlMultiVulkan(mut renderer) => {
+        RendererRef::MultiVulkan(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
@@ -1241,7 +1241,7 @@ pub fn render_window_to_buffer(
                 None
             }
         },
-        RendererRef::GlMultiGles(mut renderer) => match render_session(
+        RendererRef::MultiGles(mut renderer) => match render_session(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
             CaptureSessionRef::Session(session.clone()),
@@ -1270,7 +1270,7 @@ pub fn render_window_to_buffer(
                 None
             }
         },
-        RendererRef::GlMultiVulkan(mut renderer) => match render_session(
+        RendererRef::MultiVulkan(mut renderer) => match render_session(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
             CaptureSessionRef::Session(session.clone()),
@@ -1445,7 +1445,7 @@ pub fn render_cursor_to_buffer(
                 }
             }
         }
-        RendererRef::GlMultiGles(mut renderer) => {
+        RendererRef::MultiGles(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
@@ -1474,7 +1474,7 @@ pub fn render_cursor_to_buffer(
                 }
             }
         }
-        RendererRef::GlMultiVulkan(mut renderer) => {
+        RendererRef::MultiVulkan(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),

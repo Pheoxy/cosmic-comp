@@ -540,12 +540,12 @@ impl BackendData {
                 if let Some(nodes) = kms_node_cb(kms) {
                     let nodes = nodes.into();
                     match &mut kms.api {
-                        crate::backend::kms::render::KmsApi::Gles(api) => Ok(RendererRef::GlMultiGles(
+                        crate::backend::kms::render::KmsApi::Gles(api) => Ok(RendererRef::MultiGles(
                             api.renderer(&nodes.render_node, &nodes.target_node, nodes.copy_format)
                                 .map_err(|err| anyhow::anyhow!("{:?}", err))?,
                         )),
                         crate::backend::kms::render::KmsApi::Vulkan(api) => {
-                            Ok(RendererRef::GlMultiVulkan(
+                            Ok(RendererRef::MultiVulkan(
                                 api.renderer(&nodes.render_node, &nodes.target_node, nodes.copy_format)
                                     .map_err(|err| anyhow::anyhow!("{:?}", err))?,
                             ))
