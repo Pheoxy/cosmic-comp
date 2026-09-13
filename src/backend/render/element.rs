@@ -499,7 +499,6 @@ impl AsGlowRenderer for MultiRenderer<'_, '_, VulkanGraphics, VulkanGraphics> {
     }
 }
 
-#[cfg(feature = "renderer_vulkan")]
 impl AsGlowRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
     fn from_gles_error(_err: GlesError) -> Self::Error {
         smithay::backend::renderer::vulkan::VulkanError::UnsupportedOperation("gles chrome")

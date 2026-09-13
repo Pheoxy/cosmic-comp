@@ -10,13 +10,15 @@ use smithay::{
     },
 };
 
-#[cfg(feature = "renderer_vulkan")]
-use smithay::backend::renderer::vulkan::VulkanRenderTarget;
-#[cfg(not(feature = "renderer_vulkan"))]
-use smithay::backend::renderer::{
-    ContextId,
-    gles::{GlesRenderbuffer, GlesTexture},
+use smithay::backend::{
+    allocator::Fourcc,
+    renderer::{
+        ContextId, Renderer, Texture,
+        gles::{GlesRenderbuffer, GlesTexture},
+        vulkan::VulkanRenderTarget,
+    },
 };
+use smithay::utils::{Buffer as BufferCoords, Size};
 
 use crate::shell::{CosmicSurface, Workspace};
 
@@ -25,18 +27,54 @@ type PendingImageCopyBuffers = Mutex<Vec<(SessionRef, Frame)>>;
 
 pub type SessionData = Mutex<SessionUserData>;
 
+/// Offscreen buffer type of the KMS renderer (`Offscreen::create_buffer`), for whichever backend
+/// is actually active - runtime-selected via `KmsApi`/`COSMIC_RENDERER`, not a Cargo feature.
+pub enum SessionOffscreen {
+    Gles(ContextId<GlesTexture>, GlesRenderbuffer),
+    Vulkan(VulkanRenderTarget<'static>),
+}
+
+impl SessionOffscreen {
+    pub fn size(&self) -> Size<i32, BufferCoords> {
+        match self {
+            SessionOffscreen::Gles(_, renderbuffer) => renderbuffer.size(),
+            SessionOffscreen::Vulkan(target) => target.size(),
+        }
+    }
+
+    pub fn format(&self) -> Option<Fourcc> {
+        match self {
+            SessionOffscreen::Gles(_, renderbuffer) => renderbuffer.format(),
+            SessionOffscreen::Vulkan(target) => target.format(),
+        }
+    }
+
+    /// For the GLES variant only: whether `renderer`'s current render context differs from the one
+    /// this buffer was created on (Vulkan has no equivalent per-context tie, so always `false`).
+    pub fn is_stale_context<R: crate::backend::render::element::AsGlowRenderer>(
+        &self,
+        renderer: &R,
+    ) -> bool {
+        match self {
+            SessionOffscreen::Gles(context_id, _) => {
+                renderer.glow_renderer().map(|r| r.context_id()).as_ref() != Some(context_id)
+            }
+            SessionOffscreen::Vulkan(_) => false,
+        }
+    }
+}
+
 pub struct SessionUserData {
     pub dt: OutputDamageTracker,
-    /// Offscreen buffer type of the KMS renderer (`Offscreen::create_buffer`).
-    #[cfg(not(feature = "renderer_vulkan"))]
-    pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
-    #[cfg(feature = "renderer_vulkan")]
-    pub offscreen: Option<VulkanRenderTarget<'static>>,
+    pub offscreen: Option<SessionOffscreen>,
     /// An SHM readback for `offscreen` has been rendered and is waiting on its fence before the
     /// copy into the client buffer runs (see `render::PendingShmCopy`). While this is set, a new
     /// capture request must not re-render into `offscreen`, since the pending copy still expects
     /// this frame's contents. Reset once that copy (or its failure/timeout) completes.
-    #[cfg(feature = "renderer_vulkan")]
+    ///
+    /// Only ever set true on the Vulkan path - GLES's screencopy stays eager/synchronous and never
+    /// defers, so this is always false there, but the field itself is unconditional so session
+    /// bookkeeping doesn't need to know which backend is active.
     pub copy_pending: bool,
 }
 
@@ -45,7 +83,6 @@ impl SessionUserData {
         SessionUserData {
             dt: tracker,
             offscreen: None,
-            #[cfg(feature = "renderer_vulkan")]
             copy_pending: false,
         }
     }

@@ -5,7 +5,7 @@ use crate::backend::winit_vulkan::WinitVulkanState;
 use crate::{
     backend::{
         kms::{KmsGuard, KmsState},
-        render::{GlMultiError, RendererRef},
+        render::RendererRef,
         winit::WinitState,
         x11::X11State,
     },
@@ -534,16 +534,23 @@ impl BackendData {
     pub fn offscreen_renderer<N: Into<KmsNodes>, F: FnOnce(&mut KmsState) -> Option<N>>(
         &mut self,
         kms_node_cb: F,
-    ) -> Result<RendererRef<'_>, GlMultiError> {
+    ) -> anyhow::Result<RendererRef<'_>> {
         match self {
             BackendData::Kms(kms) => {
                 if let Some(nodes) = kms_node_cb(kms) {
                     let nodes = nodes.into();
-                    Ok(RendererRef::GlMulti(kms.api.expect_compile_time_backend().renderer(
-                        &nodes.render_node,
-                        &nodes.target_node,
-                        nodes.copy_format,
-                    )?))
+                    match &mut kms.api {
+                        crate::backend::kms::render::KmsApi::Gles(api) => Ok(RendererRef::GlMultiGles(
+                            api.renderer(&nodes.render_node, &nodes.target_node, nodes.copy_format)
+                                .map_err(|err| anyhow::anyhow!("{:?}", err))?,
+                        )),
+                        crate::backend::kms::render::KmsApi::Vulkan(api) => {
+                            Ok(RendererRef::GlMultiVulkan(
+                                api.renderer(&nodes.render_node, &nodes.target_node, nodes.copy_format)
+                                    .map_err(|err| anyhow::anyhow!("{:?}", err))?,
+                            ))
+                        }
+                    }
                 } else {
                     Ok(RendererRef::Glow(
                         kms.software_renderer
@@ -554,7 +561,9 @@ impl BackendData {
             }
             BackendData::Winit(winit) => Ok(RendererRef::Glow(winit.backend.renderer())),
             #[cfg(feature = "renderer_vulkan")]
-            BackendData::WinitVulkan(_) => Err(GlMultiError::DeviceMissing),
+            BackendData::WinitVulkan(_) => {
+                Err(anyhow::anyhow!("no offscreen renderer for nested Vulkan winit backend"))
+            }
             BackendData::X11(x11) => Ok(RendererRef::Glow(&mut x11.renderer)),
             _ => unreachable!("No backend set when getting offscreen renderer"),
         }

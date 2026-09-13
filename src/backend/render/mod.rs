@@ -98,46 +98,23 @@ use self::element::{AsGlowRenderer, CosmicElement};
 
 use super::kms::Timings;
 
-use crate::backend::kms::render::KmsGraphics;
+use crate::backend::kms::render::{GlesMultiRenderer, VulkanMultiRenderer};
 
-pub type GlMultiRenderer<'a> = MultiRenderer<'a, 'a, KmsGraphics, KmsGraphics>;
-pub type GlMultiFrame<'a, 'frame, 'buffer> =
-    MultiFrame<'a, 'a, 'frame, 'buffer, KmsGraphics, KmsGraphics>;
-pub type GlMultiError = MultiError<KmsGraphics, KmsGraphics>;
-
+/// A KMS-backed offscreen renderer, still tied to whichever concrete backend
+/// [`KmsApi`](crate::backend::kms::render::KmsApi) actually holds - real runtime selection, not the
+/// old single compile-time `GlMultiRenderer`/`KmsGraphics` alias.
 pub enum RendererRef<'a> {
     Glow(&'a mut GlowRenderer),
-    GlMulti(GlMultiRenderer<'a>),
+    GlMultiGles(GlesMultiRenderer<'a>),
+    GlMultiVulkan(VulkanMultiRenderer<'a>),
 }
 
 impl RendererRef<'_> {
     pub fn glow_renderer(&mut self) -> Option<&mut GlowRenderer> {
         match self {
             Self::Glow(renderer) => Some(renderer),
-            #[cfg(not(feature = "renderer_vulkan"))]
-            Self::GlMulti(renderer) => Some(renderer.as_mut()),
-            #[cfg(feature = "renderer_vulkan")]
-            Self::GlMulti(_) => None,
-        }
-    }
-}
-
-#[cfg(not(feature = "renderer_vulkan"))]
-impl AsRef<GlowRenderer> for RendererRef<'_> {
-    fn as_ref(&self) -> &GlowRenderer {
-        match self {
-            Self::Glow(renderer) => renderer,
-            Self::GlMulti(renderer) => renderer.as_ref(),
-        }
-    }
-}
-
-#[cfg(not(feature = "renderer_vulkan"))]
-impl AsMut<GlowRenderer> for RendererRef<'_> {
-    fn as_mut(&mut self) -> &mut GlowRenderer {
-        match self {
-            Self::Glow(renderer) => renderer,
-            Self::GlMulti(renderer) => renderer.as_mut(),
+            Self::GlMultiGles(renderer) => Some(renderer.as_mut()),
+            Self::GlMultiVulkan(_) => None,
         }
     }
 }

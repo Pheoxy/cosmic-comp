@@ -32,14 +32,11 @@ use smithay::{
         shm::{shm_format_to_fourcc, with_buffer_contents, with_buffer_contents_mut},
     },
 };
-#[cfg(feature = "renderer_vulkan")]
 use std::{cell::RefCell, rc::Rc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
-#[cfg(not(feature = "renderer_vulkan"))]
 use smithay::backend::allocator::format::get_transparent;
-#[cfg(not(feature = "renderer_vulkan"))]
 use smithay::backend::renderer::gles::GlesRenderbuffer;
 
 use crate::{
@@ -55,7 +52,8 @@ use crate::{
     utils::prelude::{PointExt, PointGlobalExt, RectExt, RectLocalExt, SeatExt},
     wayland::{
         handlers::image_copy_capture::{
-            SessionData, SessionUserData, constraints_for_output, constraints_for_toplevel,
+            SessionData, SessionOffscreen, SessionUserData, constraints_for_output,
+            constraints_for_toplevel,
         },
         protocols::workspace::WorkspaceHandle,
     },
@@ -65,8 +63,7 @@ use super::{
     super::data_device::get_dnd_icon, cursor_capture_constraints, user_data::SessionHolder,
 };
 
-#[cfg(feature = "renderer_vulkan")]
-use smithay::backend::renderer::{Texture, vulkan::VulkanRenderTarget};
+use smithay::backend::renderer::{Renderer, vulkan::VulkanRenderTarget};
 
 pub fn render_element_buffers<R, E>(
     renderer: &mut R,
@@ -93,8 +90,8 @@ pub struct PendingImageCopyData {
     // until image copy completes.
     _buffers: Vec<smithay::backend::renderer::utils::Buffer>,
     // The GPU->CPU readback for an SHM capture, still to be done once `sync` is reached. `None`
-    // for a direct dmabuf-target render, which needs no separate copy step.
-    #[cfg(feature = "renderer_vulkan")]
+    // for a direct dmabuf-target render, which needs no separate copy step. Only ever `Some` on
+    // the Vulkan path (see `SessionUserData::copy_pending`); GLES stays eager/synchronous.
     shm_copy: Option<PendingShmCopy>,
 }
 
@@ -107,7 +104,6 @@ pub enum CaptureSessionRef {
     Cursor(CursorSessionRef),
 }
 
-#[cfg(feature = "renderer_vulkan")]
 impl CaptureSessionRef {
     fn session_data(&self) -> Option<&SessionData> {
         match self {
@@ -123,7 +119,6 @@ impl CaptureSessionRef {
 /// completion needs to redo the same bind and finish the copy: the exact renderer selection used
 /// for the render (so the readback happens on the same device), and the session/destination
 /// buffer to copy into.
-#[cfg(feature = "renderer_vulkan")]
 struct PendingShmCopy {
     session: CaptureSessionRef,
     nodes: Option<KmsNodes>,
@@ -135,7 +130,6 @@ struct PendingShmCopy {
 /// used to render it, copy out, and write into the client's buffer.
 ///
 /// Must only be called once `sync` for the render has already been reached - this does not wait.
-#[cfg(feature = "renderer_vulkan")]
 fn finish_shm_copy(state: &mut State, shm_copy: &PendingShmCopy) -> Result<(), CaptureFailureReason> {
     let Some(session_data) = shm_copy.session.session_data() else {
         return Err(CaptureFailureReason::Unknown);
@@ -162,7 +156,13 @@ fn finish_shm_copy(state: &mut State, shm_copy: &PendingShmCopy) -> Result<(), C
                 CaptureFailureReason::Unknown
             })
         }
-        RendererRef::GlMulti(mut r) => {
+        RendererRef::GlMultiGles(mut r) => {
+            copy_shm_target(&mut r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
+                warn!(?err, "Failed to finish deferred SHM capture");
+                CaptureFailureReason::Unknown
+            })
+        }
+        RendererRef::GlMultiVulkan(mut r) => {
             copy_shm_target(&mut r, target, &shm_copy.buffer, shm_copy.buffer_size).map_err(|err| {
                 warn!(?err, "Failed to finish deferred SHM capture");
                 CaptureFailureReason::Unknown
@@ -179,10 +179,9 @@ fn finish_shm_copy(state: &mut State, shm_copy: &PendingShmCopy) -> Result<(), C
 }
 
 /// Re-bind `target` on `renderer`, copy it out, and memcpy the result into `buffer`.
-#[cfg(feature = "renderer_vulkan")]
 fn copy_shm_target<R>(
     renderer: &mut R,
-    target: &mut VulkanRenderTarget<'static>,
+    target: &mut SessionOffscreen,
     buffer: &WlBuffer,
     buffer_size: Size<i32, BufferCoords>,
 ) -> Result<(), R::Error>
@@ -224,7 +223,6 @@ where
 
 /// Bundle handed between the fd/timeout/idle sources racing to complete one deferred SHM copy.
 /// Whichever fires first `take()`s it; the rest find `None` and no-op.
-#[cfg(feature = "renderer_vulkan")]
 type PendingShmCopyBundle = (
     Frame,
     Vec<smithay::utils::Rectangle<i32, BufferCoords>>,
@@ -232,7 +230,6 @@ type PendingShmCopyBundle = (
     Vec<smithay::backend::renderer::utils::Buffer>,
 );
 
-#[cfg(feature = "renderer_vulkan")]
 fn run_pending_shm_copy(
     bundle: &Rc<RefCell<Option<PendingShmCopyBundle>>>,
     state: &mut State,
@@ -276,7 +273,6 @@ impl PendingImageCopyData {
     ) {
         let presented = presented.into();
 
-        #[cfg(feature = "renderer_vulkan")]
         if self.shm_copy.is_some() {
             let loop_handle_any: &dyn std::any::Any = loop_handle;
             return match loop_handle_any.downcast_ref::<LoopHandle<'static, State>>() {
@@ -321,7 +317,6 @@ impl PendingImageCopyData {
     /// `finish_shm_copy` needs `&mut State` (to re-derive the renderer), which this method does
     /// not have - only calloop callbacks do - so even the already-reached case is finished via
     /// `insert_idle` rather than called inline.
-    #[cfg(feature = "renderer_vulkan")]
     fn finish_deferred(
         self,
         transform: Transform,
@@ -400,8 +395,6 @@ where
     R: ExportMem + AsGlowRenderer,
 {
     let _ = &session_ref;
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let _ = (nodes, defer_shm_copy);
     let Some(damage) = damage else {
         frame.success(
             transform,
@@ -416,15 +409,17 @@ where
     let buffer = frame.buffer();
     let buffer_size = buffer_dimensions(&buffer).unwrap();
 
-    #[cfg(feature = "renderer_vulkan")]
     let mut shm_copy = None;
-    #[cfg(feature = "renderer_vulkan")]
     let mut sync = sync;
 
-    #[cfg(feature = "renderer_vulkan")]
+    // GLES's copy is already synchronous/eager and never stalls the compositor the way Vulkan's
+    // explicit-fence readback could, so it always takes the eager path below regardless of
+    // `defer_shm_copy` - matching this renderer's behavior before runtime selection existed.
+    let is_gles = renderer.glow_renderer().is_some();
+
     if let Some(fb) = offscreen {
         assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
-        if defer_shm_copy {
+        if defer_shm_copy && !is_gles {
             // Validate the destination buffer now so a protocol violation fails fast; the actual
             // GPU->CPU copy is deferred until `sync` is reached (`send_success_when_ready`)
             // instead of blocking this render dispatch on the compositor's event-loop thread.
@@ -459,55 +454,9 @@ where
 
             renderer.wait(&sync)?;
 
-            let mapping = renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), format)?;
-            let gl_data = renderer.map_texture(&mapping)?;
-            assert!((width * height * pixelsize) as usize <= gl_data.len());
-
-            for i in 0..height {
-                unsafe {
-                    std::ptr::copy_nonoverlapping::<u8>(
-                        gl_data.as_ptr().offset((width * pixelsize * i) as isize),
-                        ptr.offset((offset + stride * i) as isize),
-                        (width * pixelsize) as usize,
-                    );
-                }
-            }
-
-            sync = SyncPoint::signaled();
-
-            Ok(())
-        })
-        .map_err(|err| R::from_gles_error(GlesError::BufferAccessError(err)))
-        .and_then(|x| x)
-        {
-            frame.fail(CaptureFailureReason::Unknown);
-            return Err(err);
-        }
-    }
-
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let mut sync = sync;
-    #[cfg(not(feature = "renderer_vulkan"))]
-    if let Some(fb) = offscreen {
-        assert!(matches!(buffer_type(&buffer), Some(BufferType::Shm)));
-        if let Err(err) = with_buffer_contents_mut(&buffer, |ptr, len, data| {
-            let offset = data.offset;
-            let width = data.width;
-            let height = data.height;
-            let stride = data.stride;
-            let format = shm_format_to_fourcc(data.format)
-                .expect("We should be able to convert all hardcoded shm screencopy formats");
-
-            // number of bytes per pixel
-            // TODO: compute from data.format
-            let pixelsize = 4i32;
-
-            // ensure consistency, the SHM handler of smithay should ensure this
-            assert!((offset + (height - 1) * stride + width * pixelsize) as usize <= len);
-
-            // ensure rendering is done
-            renderer.wait(&sync)?;
-
+            // `get_transparent` is a GLES-specific SHM readback format adjustment; harmless no-op
+            // for a format it doesn't recognize, so applying it unconditionally is safe even
+            // though the Vulkan path only ever reaches here when `defer_shm_copy` is false.
             let copy_format = get_transparent(format).unwrap_or(format);
             let mapping =
                 renderer.copy_framebuffer(fb, Rectangle::from_size(buffer_size), copy_format)?;
@@ -524,7 +473,6 @@ where
                 }
             }
 
-            // We've already waited on the sync point and copied from the texture
             sync = SyncPoint::signaled();
 
             Ok(())
@@ -548,86 +496,115 @@ where
             .collect(),
         sync,
         _buffers: buffers,
-        #[cfg(feature = "renderer_vulkan")]
         shm_copy,
     }))
 }
 
-/// SHM capture offscreen. GLES uses Glow `Offscreen<GlesRenderbuffer>` via
-/// [`AsGlowRenderer`]. Vulkan uses smithay [`Offscreen`] / [`Bind`] of
-/// [`VulkanRenderTarget`] on the KMS/winit-vulkan renderer. Nested GLES
-/// (`GlowRenderer`) under `renderer_vulkan` cannot create that target.
-#[cfg(not(feature = "renderer_vulkan"))]
-pub trait CaptureRenderer: AsGlowRenderer {}
-#[cfg(not(feature = "renderer_vulkan"))]
-impl<R: AsGlowRenderer> CaptureRenderer for R {}
-
-#[cfg(feature = "renderer_vulkan")]
+/// SHM capture offscreen, real per-backend behavior always compiled in (runtime-selected via
+/// `KmsApi`/`COSMIC_RENDERER`, not the `renderer_vulkan` Cargo feature). GLES uses Glow
+/// `Offscreen<GlesRenderbuffer>` via [`AsGlowRenderer`]; Vulkan uses smithay [`Offscreen`] /
+/// [`Bind`] of [`VulkanRenderTarget`]. Each impl wraps its result in the matching
+/// [`SessionOffscreen`] variant so callers don't need to know which backend produced it.
 pub trait CaptureRenderer: AsGlowRenderer {
     fn create_shm_offscreen(
         &mut self,
         format: smithay::backend::allocator::Fourcc,
         size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<VulkanRenderTarget<'static>, Self::Error>;
+    ) -> Result<SessionOffscreen, Self::Error>;
 
     fn bind_shm_offscreen<'a>(
         &mut self,
-        target: &'a mut VulkanRenderTarget<'static>,
+        target: &'a mut SessionOffscreen,
     ) -> Result<Self::Framebuffer<'a>, Self::Error>;
 }
 
-#[cfg(feature = "renderer_vulkan")]
-impl CaptureRenderer for crate::backend::render::GlMultiRenderer<'_> {
+impl CaptureRenderer for crate::backend::kms::render::GlesMultiRenderer<'_> {
     fn create_shm_offscreen(
         &mut self,
         format: smithay::backend::allocator::Fourcc,
         size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
-        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(self, format, size)
+    ) -> Result<SessionOffscreen, Self::Error> {
+        let context_id = self.glow_renderer().unwrap().context_id();
+        let renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(self, format, size)?;
+        Ok(SessionOffscreen::Gles(context_id, renderbuffer))
     }
     fn bind_shm_offscreen<'a>(
         &mut self,
-        target: &'a mut VulkanRenderTarget<'static>,
+        target: &'a mut SessionOffscreen,
     ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        self.bind(target)
+        match target {
+            SessionOffscreen::Gles(_, renderbuffer) => self.bind(renderbuffer),
+            SessionOffscreen::Vulkan(_) => {
+                unreachable!("SessionOffscreen::Vulkan bound on a GLES renderer")
+            }
+        }
     }
 }
 
-#[cfg(feature = "renderer_vulkan")]
+impl CaptureRenderer for crate::backend::kms::render::VulkanMultiRenderer<'_> {
+    fn create_shm_offscreen(
+        &mut self,
+        format: smithay::backend::allocator::Fourcc,
+        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<SessionOffscreen, Self::Error> {
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(self, format, size)
+            .map(SessionOffscreen::Vulkan)
+    }
+    fn bind_shm_offscreen<'a>(
+        &mut self,
+        target: &'a mut SessionOffscreen,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        match target {
+            SessionOffscreen::Vulkan(target) => self.bind(target),
+            SessionOffscreen::Gles(..) => {
+                unreachable!("SessionOffscreen::Gles bound on a Vulkan renderer")
+            }
+        }
+    }
+}
+
 impl CaptureRenderer for smithay::backend::renderer::vulkan::VulkanRenderer {
     fn create_shm_offscreen(
         &mut self,
         format: smithay::backend::allocator::Fourcc,
         size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
+    ) -> Result<SessionOffscreen, Self::Error> {
         Offscreen::<VulkanRenderTarget<'static>>::create_buffer(self, format, size)
+            .map(SessionOffscreen::Vulkan)
     }
     fn bind_shm_offscreen<'a>(
         &mut self,
-        target: &'a mut VulkanRenderTarget<'static>,
+        target: &'a mut SessionOffscreen,
     ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        self.bind(target)
+        match target {
+            SessionOffscreen::Vulkan(target) => self.bind(target),
+            SessionOffscreen::Gles(..) => {
+                unreachable!("SessionOffscreen::Gles bound on a Vulkan renderer")
+            }
+        }
     }
 }
 
-#[cfg(feature = "renderer_vulkan")]
 impl CaptureRenderer for smithay::backend::renderer::glow::GlowRenderer {
     fn create_shm_offscreen(
         &mut self,
-        _format: smithay::backend::allocator::Fourcc,
-        _size: smithay::utils::Size<i32, smithay::utils::Buffer>,
-    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
-        Err(Self::from_gles_error(
-            smithay::backend::renderer::gles::GlesError::UnknownPixelFormat,
-        ))
+        format: smithay::backend::allocator::Fourcc,
+        size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    ) -> Result<SessionOffscreen, Self::Error> {
+        let context_id = self.context_id();
+        let renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(self, format, size)?;
+        Ok(SessionOffscreen::Gles(context_id, renderbuffer))
     }
     fn bind_shm_offscreen<'a>(
         &mut self,
-        _target: &'a mut VulkanRenderTarget<'static>,
+        target: &'a mut SessionOffscreen,
     ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        Err(Self::from_gles_error(
-            smithay::backend::renderer::gles::GlesError::UnknownPixelFormat,
-        ))
+        match target {
+            SessionOffscreen::Gles(_, renderbuffer) => self.bind(renderbuffer),
+            SessionOffscreen::Vulkan(_) => {
+                unreachable!("SessionOffscreen::Vulkan bound on a GLES renderer")
+            }
+        }
     }
 }
 
@@ -663,8 +640,8 @@ where
 
     // A previous capture on this session already rendered into `offscreen` and is waiting on its
     // fence before its deferred copy runs (see `PendingShmCopy`); re-rendering now would clobber
-    // the contents that copy still expects. Fail this request rather than race it.
-    #[cfg(feature = "renderer_vulkan")]
+    // the contents that copy still expects. Fail this request rather than race it. Only ever set
+    // on the Vulkan path; always false on GLES.
     if session_user_data.copy_pending {
         drop(session_user_data);
         frame.fail(CaptureFailureReason::Unknown);
@@ -682,39 +659,18 @@ where
         })
         .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
 
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            session_user_data
-                .offscreen
-                .take_if(|(context_id, renderbuffer)| {
-                    renderer.glow_renderer().context_id() != *context_id
-                        || renderbuffer.size() != size
-                        || renderbuffer.format() != Some(format)
-                });
+        session_user_data.offscreen.take_if(|target| {
+            target.size() != size
+                || target.format() != Some(format)
+                || target.is_stale_context(renderer)
+        });
 
-            if session_user_data.offscreen.is_none() {
-                let renderbuffer =
-                    Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
-                        .map_err(DTError::Rendering)?;
-                session_user_data.offscreen =
-                    Some((renderer.glow_renderer().context_id(), renderbuffer));
-                age = 0;
-            }
-        }
-
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            session_user_data
-                .offscreen
-                .take_if(|target| target.size() != size || target.format() != Some(format));
-
-            if session_user_data.offscreen.is_none() {
-                let target = renderer
-                    .create_shm_offscreen(format, size)
-                    .map_err(DTError::Rendering)?;
-                session_user_data.offscreen = Some(target);
-                age = 0;
-            }
+        if session_user_data.offscreen.is_none() {
+            let target = renderer
+                .create_shm_offscreen(format, size)
+                .map_err(DTError::Rendering)?;
+            session_user_data.offscreen = Some(target);
+            age = 0;
         }
     } else {
         // If for some reason a capture session is used for shm, but then changes to dmabuf capture,
@@ -722,20 +678,11 @@ where
         session_user_data.offscreen = None;
     }
 
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let SessionUserData { dt, offscreen } = &mut *session_user_data;
-    #[cfg(feature = "renderer_vulkan")]
     let SessionUserData {
         dt,
         offscreen,
         copy_pending,
     } = &mut *session_user_data;
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let mut fb = offscreen
-        .as_mut()
-        .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
-        .transpose()?;
-    #[cfg(feature = "renderer_vulkan")]
     let mut fb = if let Some(target) = offscreen.as_mut() {
         Some(
             renderer
@@ -768,7 +715,6 @@ where
     )
     .map_err(DTError::Rendering)?;
 
-    #[cfg(feature = "renderer_vulkan")]
     if let Some(p) = &pending {
         if p.shm_copy.is_some() {
             *copy_pending = true;
@@ -917,7 +863,6 @@ pub fn render_workspace_to_buffer(
     let transform = output.current_transform();
     let common = &mut state.common;
 
-    #[cfg(feature = "renderer_vulkan")]
     let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
     let renderer = match state.backend.offscreen_renderer(|kms| {
         let render_node = kms
@@ -942,7 +887,6 @@ pub fn render_workspace_to_buffer(
             target_node,
             copy_format: buffer_format.unwrap_or(Fourcc::Abgr8888),
         };
-        #[cfg(feature = "renderer_vulkan")]
         nodes_cell.set(Some(nodes));
         Some(nodes)
     }) {
@@ -953,12 +897,8 @@ pub fn render_workspace_to_buffer(
             return;
         }
     };
-    #[cfg(feature = "renderer_vulkan")]
     let nodes = nodes_cell.get();
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
-        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
@@ -990,12 +930,38 @@ pub fn render_workspace_to_buffer(
                 }
             }
         }
-        #[cfg(feature = "renderer_vulkan")]
-        RendererRef::Glow(_) => {
-            frame.fail(CaptureFailureReason::Unknown);
-            None
+        RendererRef::GlMultiGles(mut renderer) => {
+            match render_session(
+                &mut renderer,
+                session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Session(session.clone()),
+                nodes,
+                true,
+                frame,
+                transform,
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        draw_cursor,
+                        common,
+                        &output,
+                        (handle, idx),
+                    )
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    None
+                }
+            }
         }
-        RendererRef::GlMulti(mut renderer) => {
+        RendererRef::GlMultiVulkan(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),
@@ -1216,7 +1182,6 @@ pub fn render_window_to_buffer(
     let common = &mut state.common;
     let draw_cursor = session.draw_cursor();
 
-    #[cfg(feature = "renderer_vulkan")]
     let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
     let renderer = match state.backend.offscreen_renderer(|kms| {
         let node = get_dmabuf(&buffer)
@@ -1235,7 +1200,6 @@ pub fn render_window_to_buffer(
                     .flatten()
             })
             .or(*kms.primary_node.read().unwrap());
-        #[cfg(feature = "renderer_vulkan")]
         nodes_cell.set(node.map(KmsNodes::from));
         node
     }) {
@@ -1246,12 +1210,8 @@ pub fn render_window_to_buffer(
             return;
         }
     };
-    #[cfg(feature = "renderer_vulkan")]
     let nodes = nodes_cell.get();
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
-        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => match render_session(
             renderer,
             session.user_data().get::<SessionData>().unwrap(),
@@ -1281,12 +1241,36 @@ pub fn render_window_to_buffer(
                 None
             }
         },
-        #[cfg(feature = "renderer_vulkan")]
-        RendererRef::Glow(_) => {
-            frame.fail(CaptureFailureReason::Unknown);
-            None
-        }
-        RendererRef::GlMulti(mut renderer) => match render_session(
+        RendererRef::GlMultiGles(mut renderer) => match render_session(
+            &mut renderer,
+            session.user_data().get::<SessionData>().unwrap(),
+            CaptureSessionRef::Session(session.clone()),
+            nodes,
+            true,
+            frame,
+            Transform::Normal,
+            |buffer, renderer, offscreen, dt, age, additional_damage| {
+                render_fn(
+                    buffer,
+                    renderer,
+                    offscreen,
+                    dt,
+                    age,
+                    additional_damage,
+                    draw_cursor,
+                    common,
+                    toplevel,
+                    geometry,
+                )
+            },
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                tracing::warn!(?err, "Failed to render to screencopy buffer");
+                None
+            }
+        },
+        RendererRef::GlMultiVulkan(mut renderer) => match render_session(
             &mut renderer,
             session.user_data().get::<SessionData>().unwrap(),
             CaptureSessionRef::Session(session.clone()),
@@ -1417,11 +1401,9 @@ pub fn render_cursor_to_buffer(
     }
 
     let common = &mut state.common;
-    #[cfg(feature = "renderer_vulkan")]
     let nodes_cell: std::cell::Cell<Option<KmsNodes>> = std::cell::Cell::new(None);
     let renderer = match state.backend.offscreen_renderer(|kms| {
         let node = *kms.primary_node.read().unwrap();
-        #[cfg(feature = "renderer_vulkan")]
         nodes_cell.set(node.map(KmsNodes::from));
         node
     }) {
@@ -1432,12 +1414,8 @@ pub fn render_cursor_to_buffer(
             return;
         }
     };
-    #[cfg(feature = "renderer_vulkan")]
     let nodes = nodes_cell.get();
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let nodes: Option<KmsNodes> = None;
     let result = match renderer {
-        #[cfg(not(feature = "renderer_vulkan"))]
         RendererRef::Glow(renderer) => {
             match render_session(
                 renderer,
@@ -1467,12 +1445,36 @@ pub fn render_cursor_to_buffer(
                 }
             }
         }
-        #[cfg(feature = "renderer_vulkan")]
-        RendererRef::Glow(_) => {
-            frame.fail(CaptureFailureReason::Unknown);
-            None
+        RendererRef::GlMultiGles(mut renderer) => {
+            match render_session(
+                &mut renderer,
+                session.user_data().get::<SessionData>().unwrap(),
+                CaptureSessionRef::Cursor(session.clone()),
+                nodes,
+                true,
+                frame,
+                Transform::Normal,
+                |buffer, renderer, offscreen, dt, age, additional_damage| {
+                    render_fn(
+                        buffer,
+                        renderer,
+                        offscreen,
+                        dt,
+                        age,
+                        additional_damage,
+                        common,
+                        seat,
+                    )
+                },
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(?err, "Failed to render to screencopy buffer");
+                    None
+                }
+            }
         }
-        RendererRef::GlMulti(mut renderer) => {
+        RendererRef::GlMultiVulkan(mut renderer) => {
             match render_session(
                 &mut renderer,
                 session.user_data().get::<SessionData>().unwrap(),

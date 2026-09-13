@@ -109,38 +109,6 @@ impl KmsApi {
         }
     }
 
-    /// Compatibility shim for callers not yet converted to match on `KmsApi` directly (currently
-    /// `state.rs`'s `offscreen_renderer` and `wayland/handlers/drm_lease.rs`, which feed into
-    /// `RendererRef::GlMulti` - itself still tied to the single compile-time `KmsGraphics` alias,
-    /// used from 7 call sites in `image_copy_capture/render.rs` not covered by this pass).
-    ///
-    /// Returns the `GpuManager` for whichever backend the *Cargo feature* selects, panicking if
-    /// `COSMIC_RENDERER` picked the other one at runtime. Since `KmsBackendKind::selected` defaults
-    /// to Gles and this branch only diverges from the feature flag if a user explicitly sets
-    /// `COSMIC_RENDERER` against a build compiled for the other backend, this is a real but narrow
-    /// footgun - remove once `RendererRef` itself is generalized the same way `KmsApi` is here.
-    #[cfg(not(feature = "renderer_vulkan"))]
-    pub fn expect_compile_time_backend(&mut self) -> &mut GpuManager<KmsGraphics> {
-        match self {
-            KmsApi::Gles(api) => api,
-            KmsApi::Vulkan(_) => panic!(
-                "COSMIC_RENDERER=vulkan was set, but this binary was built without the \
-                 renderer_vulkan Cargo feature - offscreen_renderer/drm_lease paths can't serve \
-                 a Vulkan renderer here yet"
-            ),
-        }
-    }
-    #[cfg(feature = "renderer_vulkan")]
-    pub fn expect_compile_time_backend(&mut self) -> &mut GpuManager<KmsGraphics> {
-        match self {
-            KmsApi::Vulkan(api) => api,
-            KmsApi::Gles(_) => panic!(
-                "COSMIC_RENDERER=gles (or unset) was resolved, but this binary was built with the \
-                 renderer_vulkan Cargo feature - offscreen_renderer/drm_lease paths can't serve \
-                 a GLES renderer here yet"
-            ),
-        }
-    }
 
     /// Drops any renderer state held for `node` (e.g. on device removal or GPU loss).
     pub fn remove_node(&mut self, node: &smithay::backend::drm::DrmNode) {
