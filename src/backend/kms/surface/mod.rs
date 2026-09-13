@@ -61,6 +61,7 @@ use smithay::{
             multigpu::Error as MultiError,
             sync::SyncPoint,
             utils::with_renderer_surface_state,
+            vulkan::VulkanRenderTarget,
         },
     },
     desktop::utils::OutputPresentationFeedback,
@@ -1968,19 +1969,144 @@ fn send_screencopy_result_vulkan<'a>(
     ),
     presentation_time: Duration,
 ) -> Result<()> {
-    let _ = (
-        renderer,
-        output,
-        pre_postprocess_data,
-        tx,
-        frame_result,
-        elements,
-        session,
+    // Screen-filter postprocessing (`render_output`'s `#[cfg(not(feature = "renderer_vulkan"))]`
+    // branch in `backend/render/mod.rs`) isn't implemented for Vulkan, so `pre_postprocess_data`
+    // should never actually hold a texture on this path. Fail loudly instead of silently
+    // producing a capture that ignores it, in case that ever changes without this function being
+    // updated too.
+    if pre_postprocess_data.texture.is_some() {
+        anyhow::bail!(
+            "screencopy: postprocess texture present on the Vulkan renderer path, but Vulkan \
+             postprocessing isn't implemented - this should be unreachable"
+        );
+    }
+
+    let (damage, _) = res?;
+
+    let mut sync = SyncPoint::default();
+    let mut dmabuf_clone;
+    let mut render_buffer;
+    let buffer = frame.buffer();
+    let mut shm_buffer = false;
+    let buffer_size = buffer_dimensions(&buffer).ok_or(RenderError::<
+        <VulkanMultiRenderer as RendererSuper>::Error,
+    >::Rendering(
+        MultiError::ImportFailed
+    ))?;
+    // Reuse the frame that was just composited for scanout (`frame_result`'s swapchain buffer,
+    // exported and blitted below via `blit_frame_result`) instead of re-rendering the scene - so
+    // the only work here is resolving *where* that blit's destination is: bind the capture's own
+    // dmabuf directly if it provided one, otherwise allocate a Vulkan offscreen target to blit
+    // into before reading it back to the SHM buffer via `submit_buffer`.
+    let mut fb = if let Ok(dmabuf) = get_dmabuf(&buffer) {
+        dmabuf_clone = dmabuf.clone();
+        Some(
+            renderer
+                .bind(&mut dmabuf_clone)
+                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+        )
+    } else {
+        shm_buffer = true;
+        let format = with_buffer_contents(&buffer, |_, _, data| shm_format_to_fourcc(data.format))
+            .map_err(|_| OutputNoMode)? // eh, we have to do some error
+            .expect("We should be able to convert all hardcoded shm screencopy formats");
+
+        render_buffer =
+            Offscreen::<VulkanRenderTarget<'static>>::create_buffer(renderer, format, buffer_size)
+                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?;
+        Some(
+            renderer
+                .bind(&mut render_buffer)
+                .map_err(RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering)?,
+        )
+    };
+
+    if let Some(ref damage) = damage {
+        let (output_size, output_scale, output_transform) = (
+            output.current_mode().ok_or(OutputNoMode)?.size,
+            output.current_scale().fractional_scale(),
+            output.current_transform(),
+        );
+
+        let filter = (!session.draw_cursor())
+            .then(|| {
+                elements.iter().filter_map(|elem| {
+                    if let CosmicElement::Cursor(_) = elem {
+                        Some(elem.id().clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .into_iter()
+            .flatten();
+
+        // If the screen is rotated, we must convert damage to match output.
+        let adjusted = damage
+            .iter()
+            .copied()
+            .map(|rect| {
+                let logical = rect.to_logical(1);
+                logical
+                    .to_buffer(
+                        1,
+                        output_transform.invert(),
+                        &buffer_size.to_logical(1, output_transform),
+                    )
+                    .to_logical(1, Transform::Normal, &buffer_size)
+                    .to_physical(1)
+            })
+            .collect::<Vec<_>>();
+
+        sync = frame_result
+            .blit_frame_result(
+                output_size,
+                output_transform,
+                output_scale,
+                renderer,
+                fb.as_mut().unwrap(),
+                adjusted,
+                filter,
+            )
+            .map_err(|err| match err {
+                BlitFrameResultError::Rendering(err) => {
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                }
+                BlitFrameResultError::Export(_) => {
+                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                        MultiError::DeviceMissing,
+                    )
+                }
+            })?;
+    }
+
+    let transform = output.current_transform();
+
+    if let Some(data) = submit_buffer(
         frame,
-        res,
-        presentation_time,
-    );
-    anyhow::bail!("screencopy is not implemented on the Vulkan renderer yet")
+        renderer,
+        shm_buffer.then_some(fb.as_mut().unwrap()),
+        transform,
+        damage.as_deref(),
+        sync,
+        // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
+        vec![],
+        CaptureSessionRef::Session(session.clone()),
+        // This runs on `SurfaceThreadState`'s event loop, not `State`'s, so the vulkan SHM-copy
+        // deferral (which needs `&mut State`) is unavailable here; `false` keeps the original
+        // eager/blocking copy for this path, matching the output-capture path in render/mod.rs.
+        None,
+        false,
+    )? {
+        if frame_result.is_empty {
+            data.frame
+                .success(transform, data.damage, presentation_time);
+        } else {
+            let _ = tx.send(data);
+        }
+    }
+
+    Ok(())
 }
 
 fn send_screencopy_result_gles<'a>(
