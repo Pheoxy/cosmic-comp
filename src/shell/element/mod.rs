@@ -693,8 +693,10 @@ impl CosmicMapped {
         R::TextureId: Send + Clone + 'static,
         CosmicMappedRenderElement<R>: RenderElement<R>,
     {
-        #[cfg(all(feature = "debug", not(feature = "renderer_vulkan")))]
-        if let Some(debug) = self.debug.lock().unwrap().as_mut() {
+        #[cfg(feature = "debug")]
+        if let Some(debug) = self.debug.lock().unwrap().as_mut()
+            && let Some(glow_renderer) = renderer.glow_renderer_mut()
+        {
             let window = self.active_window();
             let window_geo = window.geometry();
             let (min_size, max_size, size) = (
@@ -708,7 +710,6 @@ impl CosmicMapped {
                 self.bbox().size,
             );
 
-            let glow_renderer = renderer.glow_renderer_mut();
             match debug.render(
                 |ctx| {
                     egui::Area::new("window".into())
