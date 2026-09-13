@@ -1026,10 +1026,14 @@ pub struct CompOutputInfo(OutputInfo);
 impl From<Output> for CompOutputInfo {
     fn from(o: Output) -> CompOutputInfo {
         let physical = o.physical_properties();
+        // TODO: populate from the EDID-derived serial once threaded through from
+        // the KMS backend (see backend/kms/device.rs, where `libdisplay_info`
+        // already parses the EDID make/model but not yet the serial).
         CompOutputInfo(OutputInfo {
             connector: o.name(),
             make: physical.make,
             model: physical.model,
+            serial: None,
         })
     }
 }
