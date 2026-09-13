@@ -28,20 +28,11 @@ pub type VulkanMultiFrame<'a, 'frame, 'buffer> =
     MultiFrame<'a, 'a, 'frame, 'buffer, VulkanGraphics, VulkanGraphics>;
 pub type VulkanMultiError = MultiError<VulkanGraphics, VulkanGraphics>;
 
-// Still compile-time-selected for now (unrelated to `redraw`, which is fully runtime-selected via
-// `KmsApi` and the `GlesMulti*`/`VulkanMulti*` aliases above): `state.rs` and
-// `wayland/handlers/image_copy_capture/render.rs` still use the old single `GlMultiRenderer` alias
-// below, resolving to one backend per build. That's a known, separate follow-up, not addressed here.
-#[cfg(not(feature = "renderer_vulkan"))]
-pub type KmsGraphics = GlesGraphics;
-#[cfg(feature = "renderer_vulkan")]
-pub type KmsGraphics = VulkanGraphics;
-
 /// Which renderer backend to use for the KMS/DRM path, chosen once at startup.
 ///
 /// Kept as a plain enum (rather than a Cargo feature) so both backends are always compiled in and
-/// selectable at runtime via `COSMIC_RENDERER`. `KmsApi` and `KmsRenderer` mirror this split for the
-/// two concrete types ([`GpuManager`]/[`MultiRenderer`]) that actually need to name one or the other.
+/// selectable at runtime via `COSMIC_RENDERER`. `KmsApi` mirrors this split for the two concrete
+/// `GpuManager` types that actually need to name one backend or the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KmsBackendKind {
     Gles,
