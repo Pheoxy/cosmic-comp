@@ -109,11 +109,15 @@ features = [
     "renderer_glow",
     "renderer_multi",
     "renderer_pixman",
+    # Always on (not gated by cosmic-comp's own `renderer_vulkan` feature below): `KmsApi`
+    # (backend/kms/render/mod.rs) selects GLES vs Vulkan at runtime via `COSMIC_RENDERER`, so both
+    # backends must always be compiled in. The `renderer_vulkan` Cargo feature still exists to gate
+    # the handful of call sites not yet migrated off the old compile-time `KmsGraphics`/`RendererRef`
+    # split (state.rs's offscreen_renderer, image_copy_capture/render.rs, screenshot.rs).
+    "renderer_vulkan",
     "wayland_frontend",
     "xwayland",
 ]
-# renderer_vulkan is opt-in via the feature below; do not enable here so GLES
-# epoch builds stay on Glow.
 
 [dependencies.smithay-egui]
 version = "0.2.0"

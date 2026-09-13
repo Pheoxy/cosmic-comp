@@ -1,7 +1,7 @@
 use crate::{
     backend::{
-        kms::render::gles::GbmGlowBackend,
-        render::{GlMultiError, wayland::SurfaceRenderElement},
+        kms::render::{GlesGraphics, VulkanGraphics, gles::GbmGlowBackend},
+        render::wayland::SurfaceRenderElement,
     },
     shell::{CosmicMappedRenderElement, WorkspaceRenderElement},
     utils::iced::IcedRenderElement,
@@ -14,14 +14,14 @@ use smithay::{
         allocator::dmabuf::Dmabuf,
         drm::DrmDeviceFd,
         renderer::{
-            Bind, Blit, ContextId, ExportMem, ImportAll, ImportMem, Renderer,
+            Bind, ContextId, ExportMem, ImportAll, ImportMem, Renderer,
             element::{
                 Element, Id, Kind, RenderElement, UnderlyingStorage,
                 utils::{CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement},
             },
-            gles::{GlesError, GlesRenderbuffer, GlesTexture, element::TextureShaderElement},
+            gles::{GlesError, GlesTexture, element::TextureShaderElement},
             glow::{GlowFrame, GlowRenderer},
-            multigpu::MultiTexture,
+            multigpu::{MultiRenderer, MultiTexture},
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
     },
@@ -30,7 +30,7 @@ use smithay::{
     },
 };
 
-use super::{GlMultiRenderer, cursor::CursorRenderElement};
+use super::cursor::CursorRenderElement;
 
 pub enum CosmicElement<R>
 where
@@ -451,8 +451,7 @@ impl AsGlowRenderer for GlowRenderer {
     }
 }
 
-#[cfg(not(feature = "renderer_vulkan"))]
-impl AsGlowRenderer for GlMultiRenderer<'_> {
+impl AsGlowRenderer for MultiRenderer<'_, '_, GlesGraphics, GlesGraphics> {
     fn glow_renderer(&self) -> Option<&GlowRenderer> {
         Some(self.as_ref())
     }
@@ -470,7 +469,7 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
         Some(frame.as_mut())
     }
     fn from_gles_error(err: GlesError) -> Self::Error {
-        GlMultiError::Render(err)
+        smithay::backend::renderer::multigpu::Error::Render(err)
     }
     fn tex_from_gl(context: &ContextId<GlesTexture>, texture: GlesTexture) -> Self::TextureId {
         MultiTexture::from_native_texture::<GbmGlowBackend<DrmDeviceFd>>(context, texture).unwrap()
@@ -483,8 +482,7 @@ impl AsGlowRenderer for GlMultiRenderer<'_> {
     }
 }
 
-#[cfg(feature = "renderer_vulkan")]
-impl AsGlowRenderer for GlMultiRenderer<'_> {
+impl AsGlowRenderer for MultiRenderer<'_, '_, VulkanGraphics, VulkanGraphics> {
     fn from_gles_error(_err: GlesError) -> Self::Error {
         smithay::backend::renderer::multigpu::Error::Render(
             smithay::backend::renderer::vulkan::VulkanError::UnsupportedOperation("gles chrome"),

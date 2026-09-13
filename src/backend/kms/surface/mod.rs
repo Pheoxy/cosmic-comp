@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    backend::render::{
-        CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
-        PostprocessShader, PostprocessState,
-        element::{CosmicElement, DamageElement},
-        init_shaders, output_elements,
+    backend::{
+        kms::render::{GlesMultiError, GlesMultiRenderer, VulkanMultiRenderer},
+        render::{
+            CLEAR_COLOR, CursorMode, PostprocessOutputConfig, PostprocessShader, PostprocessState,
+            element::{AsGlowRenderer, CosmicElement, DamageElement},
+            init_shaders, output_elements,
+        },
     },
     config::ScreenFilter,
     shell::Shell,
@@ -13,7 +15,9 @@ use crate::{
     utils::prelude::*,
     wayland::handlers::{
         compositor::recursive_frame_time_estimation,
-        image_copy_capture::{FrameHolder, PendingImageCopyData, SessionData, submit_buffer},
+        image_copy_capture::{
+            CaptureSessionRef, FrameHolder, PendingImageCopyData, SessionData, submit_buffer,
+        },
     },
 };
 
@@ -54,7 +58,7 @@ use smithay::{
                 GlesRenderbuffer, GlesRenderer, GlesTexture, Uniform, element::TextureShaderElement,
             },
             glow::GlowRenderer,
-            multigpu::{ApiDevice, Error as MultiError, GpuManager},
+            multigpu::Error as MultiError,
             sync::SyncPoint,
             utils::with_renderer_surface_state,
         },
@@ -103,7 +107,10 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::KmsGraphics};
+use super::{
+    drm_helpers,
+    render::{KmsApi, KmsBackendKind},
+};
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -130,7 +137,7 @@ pub struct Surface {
 
 pub struct SurfaceThreadState {
     // rendering
-    api: GpuManager<KmsGraphics>,
+    api: KmsApi,
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     active: Arc<AtomicBool>,
@@ -207,8 +214,9 @@ pub enum ThreadCommand {
     NodeAdded {
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
-        #[cfg(not(feature = "renderer_vulkan"))]
-        egl: EGLContext,
+        /// `Some` only for a GLES-backed node; Vulkan nodes never populate this (see
+        /// `InnerDevice::update_egl`/`update_surface_nodes`).
+        egl: Option<EGLContext>,
         sync: SyncSender<()>,
     },
     NodeRemoved {
@@ -311,29 +319,10 @@ impl Surface {
                             } else {
                                 // If we have freed the node, because it didn't have any active buffers/surfaces,
                                 // we might not be able to evaluate surface feedback yet.
-                                let render_formats = {
-                                    let renderer = kms.api.single_renderer(&source_node).ok()?;
-                                    #[cfg(not(feature = "renderer_vulkan"))]
-                                    {
-                                        renderer.dmabuf_formats()
-                                    }
-                                    #[cfg(feature = "renderer_vulkan")]
-                                    {
-                                        renderer.as_ref().wayland_sampled_dmabuf_formats()
-                                    }
-                                };
+                                let render_formats = dmabuf_formats_for(&mut kms.api, &source_node)?;
                                 // In contrast we must have the target node, if we have an active surface
-                                let target_formats = {
-                                    let renderer = kms.api.single_renderer(&target_node).unwrap();
-                                    #[cfg(not(feature = "renderer_vulkan"))]
-                                    {
-                                        renderer.dmabuf_formats()
-                                    }
-                                    #[cfg(feature = "renderer_vulkan")]
-                                    {
-                                        renderer.as_ref().wayland_sampled_dmabuf_formats()
-                                    }
-                                };
+                                let target_formats =
+                                    dmabuf_formats_for(&mut kms.api, &target_node).unwrap();
                                 let feedback = get_surface_dmabuf_feedback(
                                     source_node,
                                     target_node,
@@ -376,18 +365,12 @@ impl Surface {
         self.active.load(Ordering::SeqCst)
     }
 
-    pub fn add_node(
-        &mut self,
-        node: DrmNode,
-        gbm: GbmAllocator<DrmDeviceFd>,
-        #[cfg(not(feature = "renderer_vulkan"))] egl: EGLContext,
-    ) {
+    pub fn add_node(&mut self, node: DrmNode, gbm: GbmAllocator<DrmDeviceFd>, egl: Option<EGLContext>) {
         self.known_nodes.insert(node);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::NodeAdded {
             node,
             gbm,
-            #[cfg(not(feature = "renderer_vulkan"))]
             egl,
             sync: tx,
         });
@@ -529,20 +512,7 @@ fn surface_thread(
 
     let mut event_loop = EventLoop::try_new().unwrap();
 
-    #[cfg(not(feature = "renderer_vulkan"))]
-    let api = GpuManager::new(super::render::gles::GbmGlowBackend::<DrmDeviceFd>::default())
-        .context("Failed to initialize rendering api")?;
-    #[cfg(feature = "renderer_vulkan")]
-    let api = {
-        use smithay::backend::{
-            renderer::multigpu::vulkan::VulkanGbmBackend,
-            vulkan::{Instance, version::Version},
-        };
-        let instance = Instance::new(Version::VERSION_1_3, None)
-            .context("Failed to create Vulkan instance")?;
-        GpuManager::new(VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true))
-            .context("Failed to initialize Vulkan rendering api")?
-    };
+    let api = KmsApi::new(KmsBackendKind::selected())?;
 
     #[cfg(feature = "debug")]
     let egui = {
@@ -609,16 +579,10 @@ fn surface_thread(
             Event::Msg(ThreadCommand::NodeAdded {
                 node,
                 gbm,
-                #[cfg(not(feature = "renderer_vulkan"))]
                 egl,
                 sync,
             }) => {
-                #[cfg(not(feature = "renderer_vulkan"))]
                 if let Err(err) = state.node_added(node, gbm, egl) {
-                    warn!(?err, ?node, "Failed to add node to surface-thread");
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                if let Err(err) = state.node_added(node, gbm) {
                     warn!(?err, ?node, "Failed to add node to surface-thread");
                 }
                 let _ = sync.send(());
@@ -769,27 +733,28 @@ impl SurfaceThreadState {
         &mut self,
         node: DrmNode,
         gbm: GbmAllocator<DrmDeviceFd>,
-        #[cfg(not(feature = "renderer_vulkan"))] egl: EGLContext,
+        egl: Option<EGLContext>,
     ) -> Result<()> {
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let mut renderer =
-                unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
-            init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
-            self.api.as_mut().add_node(node, gbm, renderer);
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            self.api.as_mut().add_node(node, gbm.as_ref().clone());
+        match &mut self.api {
+            KmsApi::Gles(api) => {
+                let egl = egl.context("GLES backend requires an EGLContext for a new node")?;
+                let mut renderer =
+                    unsafe { GlowRenderer::new(egl) }.context("Failed to create renderer")?;
+                init_shaders(renderer.borrow_mut()).context("Failed to initialize shaders")?;
+                api.as_mut().add_node(node, gbm, renderer);
+            }
+            KmsApi::Vulkan(api) => {
+                api.as_mut().add_node(node, gbm.as_ref().clone());
+            }
         }
 
         Ok(())
     }
 
     fn node_removed(&mut self, node: DrmNode) {
-        self.api.as_mut().remove_node(&node);
+        self.api.remove_node(&node);
         // force enumeration
-        let _ = self.api.devices();
+        self.api.trigger_devices_enumeration();
     }
 
     #[profiling::function]
@@ -1055,20 +1020,6 @@ impl SurfaceThreadState {
             &self.shell.read(),
         );
 
-        // Acquiring a renderer can fail transiently when the underlying DRM
-        // device is lost (e.g. after a GPU reset).
-        let mut renderer = if render_node != self.target_node {
-            self.api
-                .renderer(&render_node, &self.target_node, compositor.format())
-                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
-        } else {
-            self.api
-                .single_renderer(&self.target_node)
-                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
-        };
-
-        self.timings.start_render(&self.clock);
-
         let mut additional_frame_flags = FrameFlags::empty();
         let mut remove_frame_flags = FrameFlags::empty();
 
@@ -1113,147 +1064,216 @@ impl SurfaceThreadState {
             vrr = has_active_fullscreen;
         }
 
-        let mut elements = output_elements(
-            Some(&render_node),
-            &mut renderer,
-            &self.shell,
-            self.clock.now(),
-            self.mirroring.as_ref().unwrap_or(&self.output),
-            CursorMode::All,
-            #[cfg(not(feature = "debug"))]
-            None,
-            #[cfg(feature = "debug")]
-            Some((&self.egui, &self.timings)),
-            Some(self.target_node),
-        )
-        .map_err(|err| {
-            anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
-        })?;
+        match &mut self.api {
+            KmsApi::Gles(api) => {
+                // Acquiring a renderer can fail transiently when the underlying DRM
+                // device is lost (e.g. after a GPU reset).
+                let mut renderer = if render_node != self.target_node {
+                    api.renderer(&render_node, &self.target_node, compositor.format())
+                        .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+                } else {
+                    api.single_renderer(&self.target_node)
+                        .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+                };
 
-        if vrr && fullscreen_drives_refresh_rate && !self.timings.past_min_render_time(&self.clock)
-        {
-            additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
-        };
-        self.timings.set_vrr(vrr);
-        self.timings.elements_done(&self.clock);
+                self.timings.start_render(&self.clock);
 
-        // we can't use the elements after `compositor.render_frame`,
-        // so let's collect everything we need for screencopy now
-        let mut has_cursor_mode_none = false;
-        let frames = if self.mirroring.is_none() {
-            take_screencopy_frames(&self.output, &elements, &mut has_cursor_mode_none)
-        } else {
-            Default::default()
-        };
+                let mut elements = output_elements(
+                    Some(&render_node),
+                    &mut renderer,
+                    &self.shell,
+                    self.clock.now(),
+                    self.mirroring.as_ref().unwrap_or(&self.output),
+                    CursorMode::All,
+                    #[cfg(not(feature = "debug"))]
+                    None,
+                    #[cfg(feature = "debug")]
+                    Some((&self.egui, &self.timings)),
+                    Some(self.target_node),
+                )
+                .map_err(|err| {
+                    anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
+                })?;
 
-        // actual rendering
-        #[cfg(not(feature = "renderer_vulkan"))]
-        let source_output = self
-            .mirroring
-            .as_ref()
-            .or((!self.screen_filter.is_noop()).then_some(&self.output))
-            .filter(|output| {
-                PostprocessOutputConfig::for_output_untransformed(output)
-                    != PostprocessOutputConfig::for_output(&self.output)
-                    || !self.screen_filter.is_noop()
-            });
+                if vrr
+                    && fullscreen_drives_refresh_rate
+                    && !self.timings.past_min_render_time(&self.clock)
+                {
+                    additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
+                };
+                self.timings.set_vrr(vrr);
+                self.timings.elements_done(&self.clock);
 
-        let mut pre_postprocess_data = PrePostprocessData::default();
+                // we can't use the elements after `compositor.render_frame`,
+                // so let's collect everything we need for screencopy now
+                let mut has_cursor_mode_none = false;
+                let frames = if self.mirroring.is_none() {
+                    take_screencopy_frames(&self.output, &elements, &mut has_cursor_mode_none)
+                } else {
+                    Default::default()
+                };
 
-        #[cfg(not(feature = "renderer_vulkan"))]
-        let res = if let Some(source_output) = source_output {
-            let offscreen_output_config =
-                PostprocessOutputConfig::for_output_untransformed(source_output);
-            let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
-                hash_map::Entry::Occupied(occupied) => {
-                    let postprocess_state = occupied.into_mut();
-                    // If output config is different, re-create offscreen state
-                    if postprocess_state.output_config != offscreen_output_config {
-                        *postprocess_state = PostprocessState::new_with_renderer(
-                            &mut renderer,
-                            compositor.format(),
-                            offscreen_output_config,
-                        )?
-                    }
-                    postprocess_state
-                }
-                hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(PostprocessState::new_with_renderer(
-                        &mut renderer,
-                        compositor.format(),
-                        offscreen_output_config,
-                    )?)
-                }
-            };
-
-            if has_cursor_mode_none && self.mirroring.is_none() {
-                // TODO: use `extract_if` once stablized
-                let cursor_element_count = elements
-                    .iter()
-                    .take_while(|elem| elem.kind() == Kind::Cursor)
-                    .count();
-                let cursor_elements = elements.drain(..cursor_element_count).collect::<Vec<_>>();
-                let scale = source_output.current_scale().fractional_scale().into();
-
-                let geometry: Option<Rectangle<i32, Physical>> =
-                    cursor_elements.iter().fold(None, |acc, elem| {
-                        let geometry = elem.geometry(scale);
-                        if let Some(acc) = acc {
-                            Some(acc.merge(geometry))
-                        } else {
-                            Some(geometry)
-                        }
+                // actual rendering
+                let source_output = self
+                    .mirroring
+                    .as_ref()
+                    .or((!self.screen_filter.is_noop()).then_some(&self.output))
+                    .filter(|output| {
+                        PostprocessOutputConfig::for_output_untransformed(output)
+                            != PostprocessOutputConfig::for_output(&self.output)
+                            || !self.screen_filter.is_noop()
                     });
 
-                if let Some(geometry) = geometry {
-                    let cursor_elements = cursor_elements
-                        .into_iter()
-                        .map(|elem| {
-                            RelocateRenderElement::from_element(
-                                elem,
-                                Point::from((-geometry.loc.x, -geometry.loc.y)),
-                                Relocate::Relative,
-                            )
-                        })
-                        .collect::<Vec<_>>();
+                let mut pre_postprocess_data = PrePostprocessData::default();
 
-                    postprocess_state.track_cursor(
-                        &mut renderer,
-                        Fourcc::Abgr8888,
-                        geometry.size,
-                        scale,
-                    )?;
+                let res = if let Some(source_output) = source_output {
+                    let offscreen_output_config =
+                        PostprocessOutputConfig::for_output_untransformed(source_output);
+                    let postprocess_state = match self.postprocess_textures.entry(self.target_node)
+                    {
+                        hash_map::Entry::Occupied(occupied) => {
+                            let postprocess_state = occupied.into_mut();
+                            // If output config is different, re-create offscreen state
+                            if postprocess_state.output_config != offscreen_output_config {
+                                *postprocess_state = PostprocessState::new_with_renderer(
+                                    &mut renderer,
+                                    compositor.format(),
+                                    offscreen_output_config,
+                                )?
+                            }
+                            postprocess_state
+                        }
+                        hash_map::Entry::Vacant(vacant) => {
+                            vacant.insert(PostprocessState::new_with_renderer(
+                                &mut renderer,
+                                compositor.format(),
+                                offscreen_output_config,
+                            )?)
+                        }
+                    };
+
+                    if has_cursor_mode_none && self.mirroring.is_none() {
+                        // TODO: use `extract_if` once stablized
+                        let cursor_element_count = elements
+                            .iter()
+                            .take_while(|elem| elem.kind() == Kind::Cursor)
+                            .count();
+                        let cursor_elements =
+                            elements.drain(..cursor_element_count).collect::<Vec<_>>();
+                        let scale = source_output.current_scale().fractional_scale().into();
+
+                        let geometry: Option<Rectangle<i32, Physical>> =
+                            cursor_elements.iter().fold(None, |acc, elem| {
+                                let geometry = elem.geometry(scale);
+                                if let Some(acc) = acc {
+                                    Some(acc.merge(geometry))
+                                } else {
+                                    Some(geometry)
+                                }
+                            });
+
+                        if let Some(geometry) = geometry {
+                            let cursor_elements = cursor_elements
+                                .into_iter()
+                                .map(|elem| {
+                                    RelocateRenderElement::from_element(
+                                        elem,
+                                        Point::from((-geometry.loc.x, -geometry.loc.y)),
+                                        Relocate::Relative,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+
+                            postprocess_state.track_cursor(
+                                &mut renderer,
+                                Fourcc::Abgr8888,
+                                geometry.size,
+                                scale,
+                            )?;
+
+                            postprocess_state
+                                .cursor_texture
+                                .as_mut()
+                                .unwrap()
+                                .render()
+                                .draw::<_, <GlesMultiRenderer as RendererSuper>::Error>(|tex| {
+                                    if self.mirroring.is_none() {
+                                        pre_postprocess_data.cursor_geometry = Some(geometry);
+                                        pre_postprocess_data.cursor_texture = Some(tex.clone());
+                                    }
+
+                                    let mut fb = renderer.bind(tex)?;
+                                    let res = match postprocess_state
+                                        .cursor_damage_tracker
+                                        .as_mut()
+                                        .unwrap()
+                                        .render_output(
+                                            &mut renderer,
+                                            &mut fb,
+                                            1,
+                                            &cursor_elements,
+                                            [0.0, 0.0, 0.0, 0.0],
+                                        ) {
+                                        Ok(res) => res,
+                                        Err(RenderError::Rendering(err)) => return Err(err),
+                                        Err(RenderError::OutputNoMode(_)) => unreachable!(),
+                                    };
+
+                                    if self.mirroring.is_none() {
+                                        pre_postprocess_data.states = Some(res.states);
+                                    }
+
+                                    renderer.wait(&res.sync)?;
+                                    std::mem::drop(fb);
+
+                                    let transform = source_output.current_transform();
+                                    let area = tex.size().to_logical(1, transform);
+
+                                    Ok(res
+                                        .damage
+                                        .cloned()
+                                        .map(|v| {
+                                            v.into_iter()
+                                                .map(|r| {
+                                                    r.to_logical(1).to_buffer(1, transform, &area)
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default())
+                                })
+                                .context("Failed to draw to offscreen render target")?;
+                        }
+                    } else {
+                        postprocess_state.remove_cursor();
+                    }
 
                     postprocess_state
-                        .cursor_texture
-                        .as_mut()
-                        .unwrap()
+                        .texture
                         .render()
-                        .draw::<_, <GlMultiRenderer as RendererSuper>::Error>(|tex| {
+                        .draw::<_, <GlesMultiRenderer as RendererSuper>::Error>(|tex| {
                             if self.mirroring.is_none() {
-                                pre_postprocess_data.cursor_geometry = Some(geometry);
-                                pre_postprocess_data.cursor_texture = Some(tex.clone());
+                                pre_postprocess_data.texture = Some(tex.clone());
                             }
 
                             let mut fb = renderer.bind(tex)?;
-                            let res = match postprocess_state
-                                .cursor_damage_tracker
-                                .as_mut()
-                                .unwrap()
-                                .render_output(
-                                    &mut renderer,
-                                    &mut fb,
-                                    1,
-                                    &cursor_elements,
-                                    [0.0, 0.0, 0.0, 0.0],
-                                ) {
+                            let res = match postprocess_state.damage_tracker.render_output(
+                                &mut renderer,
+                                &mut fb,
+                                1,
+                                &elements,
+                                CLEAR_COLOR,
+                            ) {
                                 Ok(res) => res,
                                 Err(RenderError::Rendering(err)) => return Err(err),
                                 Err(RenderError::OutputNoMode(_)) => unreachable!(),
                             };
 
                             if self.mirroring.is_none() {
-                                pre_postprocess_data.states = Some(res.states);
+                                if let Some(states) = pre_postprocess_data.states.as_mut() {
+                                    states.states.extend(res.states.states);
+                                } else {
+                                    pre_postprocess_data.states = Some(res.states);
+                                }
                             }
 
                             renderer.wait(&res.sync)?;
@@ -1273,254 +1293,402 @@ impl SurfaceThreadState {
                                 .unwrap_or_default())
                         })
                         .context("Failed to draw to offscreen render target")?;
-                }
-            } else {
-                postprocess_state.remove_cursor();
-            }
 
-            postprocess_state
-                .texture
-                .render()
-                .draw::<_, <GlMultiRenderer as RendererSuper>::Error>(|tex| {
-                    if self.mirroring.is_none() {
-                        pre_postprocess_data.texture = Some(tex.clone());
-                    }
+                    renderer = api
+                        .single_renderer(&self.target_node)
+                        .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?;
 
-                    let mut fb = renderer.bind(tex)?;
-                    let res = match postprocess_state.damage_tracker.render_output(
+                    elements = postprocess_elements(
                         &mut renderer,
-                        &mut fb,
-                        1,
+                        &self.output,
+                        &pre_postprocess_data,
+                        postprocess_state,
+                        &self.screen_filter,
+                    );
+
+                    if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+                        warn!("Unable to set adaptive VRR state: {}", err);
+                    }
+                    compositor.render_frame(
+                        &mut renderer,
                         &elements,
-                        CLEAR_COLOR,
-                    ) {
-                        Ok(res) => res,
-                        Err(RenderError::Rendering(err)) => return Err(err),
-                        Err(RenderError::OutputNoMode(_)) => unreachable!(),
-                    };
-
-                    if self.mirroring.is_none() {
-                        if let Some(states) = pre_postprocess_data.states.as_mut() {
-                            states.states.extend(res.states.states);
-                        } else {
-                            pre_postprocess_data.states = Some(res.states);
-                        }
-                    }
-
-                    renderer.wait(&res.sync)?;
-                    std::mem::drop(fb);
-
-                    let transform = source_output.current_transform();
-                    let area = tex.size().to_logical(1, transform);
-
-                    Ok(res
-                        .damage
-                        .cloned()
-                        .map(|v| {
-                            v.into_iter()
-                                .map(|r| r.to_logical(1).to_buffer(1, transform, &area))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default())
-                })
-                .context("Failed to draw to offscreen render target")?;
-
-            renderer = self
-                .api
-                .single_renderer(&self.target_node)
-                .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?;
-
-            elements = postprocess_elements(
-                &mut renderer,
-                &self.output,
-                &pre_postprocess_data,
-                postprocess_state,
-                &self.screen_filter,
-            );
-
-            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
-                warn!("Unable to set adaptive VRR state: {}", err);
-            }
-            compositor.render_frame(
-                &mut renderer,
-                &elements,
-                [0.0, 0.0, 0.0, 0.0],
-                self.frame_flags
-                    .union(additional_frame_flags)
-                    .difference(remove_frame_flags),
-            )
-        } else {
-            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
-                warn!("Unable to set adaptive VRR state: {}", err);
-            }
-            compositor.render_frame(
-                &mut renderer,
-                &elements,
-                CLEAR_COLOR, // TODO use a theme neutral color
-                self.frame_flags
-                    .union(additional_frame_flags)
-                    .difference(remove_frame_flags),
-            )
-        };
-
-        #[cfg(feature = "renderer_vulkan")]
-        let res = {
-            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
-                warn!("Unable to set adaptive VRR state: {}", err);
-            }
-            compositor.render_frame(
-                &mut renderer,
-                &elements,
-                CLEAR_COLOR, // TODO use a theme neutral color
-                self.frame_flags
-                    .union(additional_frame_flags)
-                    .difference(remove_frame_flags),
-            )
-        };
-        self.timings.draw_done(&self.clock);
-
-        match res {
-            Ok(frame_result) => {
-                let output_scale = Scale::from(self.output.current_scale().fractional_scale());
-                let output_geo = Rectangle::from_size(
-                    self.output
-                        .current_mode()
-                        .map(|mode| mode.size)
-                        .unwrap_or_default(),
-                );
-                let had_visible_cursor = elements.iter().any(|elem| {
-                    elem.kind() == Kind::Cursor
-                        && elem
-                            .geometry(output_scale)
-                            .intersection(output_geo)
-                            .is_some_and(|geo| geo.size.w > 0 && geo.size.h > 0)
-                });
-                let hw_cursor = frame_result.cursor_element.is_some();
-                let primary = match &frame_result.primary_element {
-                    PrimaryPlaneElement::Swapchain(_) => "composited",
-                    PrimaryPlaneElement::Element(_) => "scanout",
-                };
-                trace!(
-                    primary,
-                    overlays = frame_result.overlay_elements.len(),
-                    hw_cursor,
-                    "kms frame planes"
-                );
-                if had_visible_cursor && !hw_cursor {
-                    let now = Instant::now();
-                    let should_warn = self
-                        .last_cursor_plane_miss
-                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5));
-                    if should_warn {
-                        warn!(
-                            flags = ?self.frame_flags,
-                            "cursor plane not assigned; pointer composited on primary (software cursor)"
-                        );
-                        self.last_cursor_plane_miss = Some(now);
-                    }
-                } else if hw_cursor {
-                    self.last_cursor_plane_miss = None;
-                }
-
-                let (tx, rx) = std::sync::mpsc::channel();
-
-                let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
-                    Some((
-                        self.shell
-                            .read()
-                            .take_presentation_feedback(&self.output, &frame_result.states),
-                        rx,
-                        estimated_presentation,
-                    ))
+                        [0.0, 0.0, 0.0, 0.0],
+                        self.frame_flags
+                            .union(additional_frame_flags)
+                            .difference(remove_frame_flags),
+                    )
                 } else {
-                    None
+                    if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+                        warn!("Unable to set adaptive VRR state: {}", err);
+                    }
+                    compositor.render_frame(
+                        &mut renderer,
+                        &elements,
+                        CLEAR_COLOR, // TODO use a theme neutral color
+                        self.frame_flags
+                            .union(additional_frame_flags)
+                            .difference(remove_frame_flags),
+                    )
                 };
+                self.timings.draw_done(&self.clock);
 
-                if frame_result.needs_sync()
-                    && let PrimaryPlaneElement::Swapchain(elem) = &frame_result.primary_element
-                {
-                    elem.sync.wait()?;
-                }
-
-                match compositor.queue_frame(feedback) {
-                    x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
-                        self.timings.submitted_for_presentation(&self.clock);
-
-                        // Update `state` after `queue_frame`, before any early return from errors
-                        if x.is_ok() {
-                            let new_state = QueueState::WaitingForVBlank {
-                                redraw_needed: false,
-                            };
-                            match mem::replace(&mut self.state, new_state) {
-                                QueueState::Idle => unreachable!(),
-                                QueueState::Queued(_) => (),
-                                QueueState::WaitingForVBlank { .. } => unreachable!(),
-                                QueueState::WaitingForEstimatedVBlank(estimated_vblank)
-                                | QueueState::WaitingForEstimatedVBlankAndQueued {
-                                    estimated_vblank,
-                                    ..
-                                } => {
-                                    self.loop_handle.remove(estimated_vblank);
-                                }
-                            };
-                        }
-
-                        let now = self.clock.now();
-                        for (session, frame, res) in frames {
-                            if let Err(err) = send_screencopy_result(
-                                &mut renderer,
-                                &self.output,
-                                &mut pre_postprocess_data,
-                                &tx,
-                                &frame_result,
-                                &elements,
-                                (&session, frame, res),
-                                now.into(),
-                            ) {
-                                tracing::warn!(?err, "Failed to screencopy");
+                match res {
+                    Ok(frame_result) => {
+                        let output_scale =
+                            Scale::from(self.output.current_scale().fractional_scale());
+                        let output_geo = Rectangle::from_size(
+                            self.output
+                                .current_mode()
+                                .map(|mode| mode.size)
+                                .unwrap_or_default(),
+                        );
+                        let had_visible_cursor = elements.iter().any(|elem| {
+                            elem.kind() == Kind::Cursor
+                                && elem
+                                    .geometry(output_scale)
+                                    .intersection(output_geo)
+                                    .is_some_and(|geo| geo.size.w > 0 && geo.size.h > 0)
+                        });
+                        let hw_cursor = frame_result.cursor_element.is_some();
+                        let primary = match &frame_result.primary_element {
+                            PrimaryPlaneElement::Swapchain(_) => "composited",
+                            PrimaryPlaneElement::Element(_) => "scanout",
+                        };
+                        trace!(
+                            primary,
+                            overlays = frame_result.overlay_elements.len(),
+                            hw_cursor,
+                            "kms frame planes"
+                        );
+                        if had_visible_cursor && !hw_cursor {
+                            let now = Instant::now();
+                            let should_warn = self.last_cursor_plane_miss.is_none_or(|last| {
+                                now.duration_since(last) >= Duration::from_secs(5)
+                            });
+                            if should_warn {
+                                warn!(
+                                    flags = ?self.frame_flags,
+                                    "cursor plane not assigned; pointer composited on primary (software cursor)"
+                                );
+                                self.last_cursor_plane_miss = Some(now);
                             }
+                        } else if hw_cursor {
+                            self.last_cursor_plane_miss = None;
                         }
 
-                        if self.mirroring.is_none() {
-                            // If postprocessing, use states from first render
-                            let states = pre_postprocess_data.states.unwrap_or(frame_result.states);
-                            self.send_dmabuf_feedback(states);
-                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
 
-                        if x.is_ok() {
-                            if self.mirroring.is_none() {
-                                self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
-                                self.send_frame_callbacks();
-                            }
-                        } else {
-                            // we don't expect a vblank
-                            let _ = self.vblank_frame.take();
-
-                            self.queue_estimated_vblank(
+                        let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
+                            Some((
+                                self.shell.read().take_presentation_feedback(
+                                    &self.output,
+                                    &frame_result.states,
+                                ),
+                                rx,
                                 estimated_presentation,
-                                // Make sure we redraw to reevaluate, if we intentionally missed content
-                                additional_frame_flags
-                                    .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
-                            );
+                            ))
+                        } else {
+                            None
+                        };
+
+                        if frame_result.needs_sync()
+                            && let PrimaryPlaneElement::Swapchain(elem) =
+                                &frame_result.primary_element
+                        {
+                            elem.sync.wait()?;
                         }
+
+                        match compositor.queue_frame(feedback) {
+                            x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
+                                self.timings.submitted_for_presentation(&self.clock);
+
+                                // Update `state` after `queue_frame`, before any early return from errors
+                                if x.is_ok() {
+                                    let new_state = QueueState::WaitingForVBlank {
+                                        redraw_needed: false,
+                                    };
+                                    match mem::replace(&mut self.state, new_state) {
+                                        QueueState::Idle => unreachable!(),
+                                        QueueState::Queued(_) => (),
+                                        QueueState::WaitingForVBlank { .. } => unreachable!(),
+                                        QueueState::WaitingForEstimatedVBlank(estimated_vblank)
+                                        | QueueState::WaitingForEstimatedVBlankAndQueued {
+                                            estimated_vblank,
+                                            ..
+                                        } => {
+                                            self.loop_handle.remove(estimated_vblank);
+                                        }
+                                    };
+                                }
+
+                                let now = self.clock.now();
+                                for (session, frame, res) in frames {
+                                    if let Err(err) = send_screencopy_result_gles(
+                                        &mut renderer,
+                                        &self.output,
+                                        &mut pre_postprocess_data,
+                                        &tx,
+                                        &frame_result,
+                                        &elements,
+                                        (&session, frame, res),
+                                        now.into(),
+                                    ) {
+                                        tracing::warn!(?err, "Failed to screencopy");
+                                    }
+                                }
+
+                                if self.mirroring.is_none() {
+                                    // If postprocessing, use states from first render
+                                    let states =
+                                        pre_postprocess_data.states.unwrap_or(frame_result.states);
+                                    self.send_dmabuf_feedback(states);
+                                }
+
+                                if x.is_ok() {
+                                    if self.mirroring.is_none() {
+                                        self.frame_callback_seq =
+                                            self.frame_callback_seq.wrapping_add(1);
+                                        self.send_frame_callbacks();
+                                    }
+                                } else {
+                                    // we don't expect a vblank
+                                    let _ = self.vblank_frame.take();
+
+                                    self.queue_estimated_vblank(
+                                        estimated_presentation,
+                                        // Make sure we redraw to reevaluate, if we intentionally missed content
+                                        additional_frame_flags
+                                            .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                for (_session, frame, _) in frames {
+                                    frame.fail(CaptureFailureReason::Unknown);
+                                }
+                                return Err(err).with_context(|| "Failed to submit result for display");
+                            }
+                        };
                     }
                     Err(err) => {
-                        for (_session, frame, _) in frames {
-                            frame.fail(CaptureFailureReason::Unknown);
-                        }
-                        return Err(err).with_context(|| "Failed to submit result for display");
+                        compositor.reset_buffers();
+                        anyhow::bail!("Rendering failed: {}", err);
                     }
-                };
+                }
             }
-            Err(err) => {
-                compositor.reset_buffers();
-                anyhow::bail!("Rendering failed: {}", err);
+            KmsApi::Vulkan(api) => {
+                // Acquiring a renderer can fail transiently when the underlying DRM
+                // device is lost (e.g. after a GPU reset).
+                let mut renderer = if render_node != self.target_node {
+                    api.renderer(&render_node, &self.target_node, compositor.format())
+                        .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+                } else {
+                    api.single_renderer(&self.target_node)
+                        .map_err(|err| anyhow::format_err!("Failed to create renderer: {:?}", err))?
+                };
+
+                self.timings.start_render(&self.clock);
+
+                let elements = output_elements(
+                    Some(&render_node),
+                    &mut renderer,
+                    &self.shell,
+                    self.clock.now(),
+                    self.mirroring.as_ref().unwrap_or(&self.output),
+                    CursorMode::All,
+                    #[cfg(not(feature = "debug"))]
+                    None,
+                    #[cfg(feature = "debug")]
+                    Some((&self.egui, &self.timings)),
+                    Some(self.target_node),
+                )
+                .map_err(|err| {
+                    anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
+                })?;
+
+                if vrr
+                    && fullscreen_drives_refresh_rate
+                    && !self.timings.past_min_render_time(&self.clock)
+                {
+                    additional_frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
+                };
+                self.timings.set_vrr(vrr);
+                self.timings.elements_done(&self.clock);
+
+                // we can't use the elements after `compositor.render_frame`,
+                // so let's collect everything we need for screencopy now
+                let mut has_cursor_mode_none = false;
+                let frames = if self.mirroring.is_none() {
+                    take_screencopy_frames(&self.output, &elements, &mut has_cursor_mode_none)
+                } else {
+                    Default::default()
+                };
+
+                // No postprocessing (screen filters) support on Vulkan yet.
+                let mut pre_postprocess_data = PrePostprocessData::default();
+
+                let res = {
+                    if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+                        warn!("Unable to set adaptive VRR state: {}", err);
+                    }
+                    compositor.render_frame(
+                        &mut renderer,
+                        &elements,
+                        CLEAR_COLOR, // TODO use a theme neutral color
+                        self.frame_flags
+                            .union(additional_frame_flags)
+                            .difference(remove_frame_flags),
+                    )
+                };
+                self.timings.draw_done(&self.clock);
+
+                match res {
+                    Ok(frame_result) => {
+                        let output_scale =
+                            Scale::from(self.output.current_scale().fractional_scale());
+                        let output_geo = Rectangle::from_size(
+                            self.output
+                                .current_mode()
+                                .map(|mode| mode.size)
+                                .unwrap_or_default(),
+                        );
+                        let had_visible_cursor = elements.iter().any(|elem| {
+                            elem.kind() == Kind::Cursor
+                                && elem
+                                    .geometry(output_scale)
+                                    .intersection(output_geo)
+                                    .is_some_and(|geo| geo.size.w > 0 && geo.size.h > 0)
+                        });
+                        let hw_cursor = frame_result.cursor_element.is_some();
+                        let primary = match &frame_result.primary_element {
+                            PrimaryPlaneElement::Swapchain(_) => "composited",
+                            PrimaryPlaneElement::Element(_) => "scanout",
+                        };
+                        trace!(
+                            primary,
+                            overlays = frame_result.overlay_elements.len(),
+                            hw_cursor,
+                            "kms frame planes"
+                        );
+                        if had_visible_cursor && !hw_cursor {
+                            let now = Instant::now();
+                            let should_warn = self.last_cursor_plane_miss.is_none_or(|last| {
+                                now.duration_since(last) >= Duration::from_secs(5)
+                            });
+                            if should_warn {
+                                warn!(
+                                    flags = ?self.frame_flags,
+                                    "cursor plane not assigned; pointer composited on primary (software cursor)"
+                                );
+                                self.last_cursor_plane_miss = Some(now);
+                            }
+                        } else if hw_cursor {
+                            self.last_cursor_plane_miss = None;
+                        }
+
+                        let (tx, rx) = std::sync::mpsc::channel();
+
+                        let feedback = if !frame_result.is_empty && self.mirroring.is_none() {
+                            Some((
+                                self.shell.read().take_presentation_feedback(
+                                    &self.output,
+                                    &frame_result.states,
+                                ),
+                                rx,
+                                estimated_presentation,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        if frame_result.needs_sync()
+                            && let PrimaryPlaneElement::Swapchain(elem) =
+                                &frame_result.primary_element
+                        {
+                            elem.sync.wait()?;
+                        }
+
+                        match compositor.queue_frame(feedback) {
+                            x @ Ok(()) | x @ Err(FrameError::EmptyFrame) => {
+                                self.timings.submitted_for_presentation(&self.clock);
+
+                                // Update `state` after `queue_frame`, before any early return from errors
+                                if x.is_ok() {
+                                    let new_state = QueueState::WaitingForVBlank {
+                                        redraw_needed: false,
+                                    };
+                                    match mem::replace(&mut self.state, new_state) {
+                                        QueueState::Idle => unreachable!(),
+                                        QueueState::Queued(_) => (),
+                                        QueueState::WaitingForVBlank { .. } => unreachable!(),
+                                        QueueState::WaitingForEstimatedVBlank(estimated_vblank)
+                                        | QueueState::WaitingForEstimatedVBlankAndQueued {
+                                            estimated_vblank,
+                                            ..
+                                        } => {
+                                            self.loop_handle.remove(estimated_vblank);
+                                        }
+                                    };
+                                }
+
+                                let now = self.clock.now();
+                                for (session, frame, res) in frames {
+                                    if let Err(err) = send_screencopy_result_vulkan(
+                                        &mut renderer,
+                                        &self.output,
+                                        &mut pre_postprocess_data,
+                                        &tx,
+                                        &frame_result,
+                                        &elements,
+                                        (&session, frame, res),
+                                        now.into(),
+                                    ) {
+                                        tracing::warn!(?err, "Failed to screencopy");
+                                    }
+                                }
+
+                                if self.mirroring.is_none() {
+                                    // If postprocessing, use states from first render
+                                    let states =
+                                        pre_postprocess_data.states.unwrap_or(frame_result.states);
+                                    self.send_dmabuf_feedback(states);
+                                }
+
+                                if x.is_ok() {
+                                    if self.mirroring.is_none() {
+                                        self.frame_callback_seq =
+                                            self.frame_callback_seq.wrapping_add(1);
+                                        self.send_frame_callbacks();
+                                    }
+                                } else {
+                                    // we don't expect a vblank
+                                    let _ = self.vblank_frame.take();
+
+                                    self.queue_estimated_vblank(
+                                        estimated_presentation,
+                                        // Make sure we redraw to reevaluate, if we intentionally missed content
+                                        additional_frame_flags
+                                            .contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES),
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                for (_session, frame, _) in frames {
+                                    frame.fail(CaptureFailureReason::Unknown);
+                                }
+                                return Err(err).with_context(|| "Failed to submit result for display");
+                            }
+                        };
+                    }
+                    Err(err) => {
+                        compositor.reset_buffers();
+                        anyhow::bail!("Rendering failed: {}", err);
+                    }
+                }
             }
         }
 
-        for device in self.api.devices_mut()? {
-            device.renderer_mut().cleanup_texture_cache()?;
-        }
+        self.api.cleanup_texture_caches()?;
 
         Ok(())
     }
@@ -1584,6 +1752,23 @@ impl SurfaceThreadState {
         let _ = self
             .thread_sender
             .send(SurfaceCommand::RenderStates(states));
+    }
+}
+
+/// The dmabuf import formats to advertise to clients for `node`, or `None` if no renderer for it
+/// could be acquired. GLES advertises its full generic `ImportDma::dmabuf_formats()`; Vulkan
+/// advertises the narrower, publicly-safe set from `wayland_sampled_dmabuf_formats()` instead
+/// (see `VulkanRenderer::validate_sampled_dmabuf_public_advertisement_contract`).
+fn dmabuf_formats_for(api: &mut KmsApi, node: &DrmNode) -> Option<FormatSet> {
+    match api {
+        KmsApi::Gles(api) => {
+            let renderer = api.single_renderer(node).ok()?;
+            Some(renderer.dmabuf_formats())
+        }
+        KmsApi::Vulkan(api) => {
+            let renderer = api.single_renderer(node).ok()?;
+            Some(renderer.as_ref().wayland_sampled_dmabuf_formats())
+        }
     }
 }
 
@@ -1699,15 +1884,19 @@ fn get_surface_dmabuf_feedback(
     }
 }
 
-fn take_screencopy_frames(
+fn take_screencopy_frames<R>(
     output: &Output,
-    elements: &[CosmicElement<GlMultiRenderer>],
+    elements: &[CosmicElement<R>],
     has_cursor_mode_none: &mut bool,
 ) -> Vec<(
     ScreencopySessionRef,
     ScreencopyFrame,
     Result<(Option<Vec<Rectangle<i32, Physical>>>, RenderElementStates), OutputNoMode>,
-)> {
+)>
+where
+    R: AsGlowRenderer,
+    R::TextureId: Send + 'static,
+{
     output
         .take_pending_frames()
         .into_iter()
@@ -1765,14 +1954,13 @@ fn take_screencopy_frames(
         .collect()
 }
 
-#[cfg(feature = "renderer_vulkan")]
-fn send_screencopy_result<'a>(
-    renderer: &mut GlMultiRenderer<'a>,
+fn send_screencopy_result_vulkan<'a>(
+    renderer: &mut VulkanMultiRenderer<'a>,
     output: &Output,
     pre_postprocess_data: &mut PrePostprocessData,
     tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
-    frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<GlMultiRenderer<'a>>>,
-    elements: &[CosmicElement<GlMultiRenderer<'a>>],
+    frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<VulkanMultiRenderer<'a>>>,
+    elements: &[CosmicElement<VulkanMultiRenderer<'a>>],
     (session, frame, res): (
         &ScreencopySessionRef,
         ScreencopyFrame,
@@ -1792,17 +1980,16 @@ fn send_screencopy_result<'a>(
         res,
         presentation_time,
     );
-    anyhow::bail!("screencopy is not implemented on renderer_vulkan yet")
+    anyhow::bail!("screencopy is not implemented on the Vulkan renderer yet")
 }
 
-#[cfg(not(feature = "renderer_vulkan"))]
-fn send_screencopy_result<'a>(
-    renderer: &mut GlMultiRenderer<'a>,
+fn send_screencopy_result_gles<'a>(
+    renderer: &mut GlesMultiRenderer<'a>,
     output: &Output,
     pre_postprocess_data: &mut PrePostprocessData,
     tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
-    frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<GlMultiRenderer<'a>>>,
-    elements: &[CosmicElement<GlMultiRenderer<'a>>],
+    frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<GlesMultiRenderer<'a>>>,
+    elements: &[CosmicElement<GlesMultiRenderer<'a>>],
     (session, frame, res): (
         &ScreencopySessionRef,
         ScreencopyFrame,
@@ -1818,7 +2005,7 @@ fn send_screencopy_result<'a>(
     let buffer = frame.buffer();
     let mut shm_buffer = false;
     let buffer_size = buffer_dimensions(&buffer).ok_or(RenderError::<
-        <GlMultiRenderer as RendererSuper>::Error,
+        <GlesMultiRenderer as RendererSuper>::Error,
     >::Rendering(
         MultiError::ImportFailed
     ))?;
@@ -1827,7 +2014,7 @@ fn send_screencopy_result<'a>(
         Some(
             renderer
                 .bind(&mut dmabuf_clone)
-                .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?,
+                .map_err(RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering)?,
         )
     } else {
         shm_buffer = true;
@@ -1845,11 +2032,11 @@ fn send_screencopy_result<'a>(
         } else {
             render_buffer =
                 Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)
-                    .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?;
+                    .map_err(RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering)?;
             Some(
                 renderer
                     .bind(&mut render_buffer)
-                    .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?,
+                    .map_err(RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering)?,
             )
         }
     };
@@ -1894,7 +2081,7 @@ fn send_screencopy_result<'a>(
         if let Some(tex) = pre_postprocess_data.texture.as_mut() {
             let tex_fb = renderer
                 .bind(tex)
-                .map_err(RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering)?;
+                .map_err(RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering)?;
 
             if let Some(fb) = fb.as_mut() {
                 for rect in adjusted.iter().copied() {
@@ -1902,7 +2089,7 @@ fn send_screencopy_result<'a>(
                     sync = renderer
                         .blit(&tex_fb, fb, rect, rect, TextureFilter::Linear)
                         .map_err(
-                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering,
                         )?;
                 }
                 if let Some(cursor_geometry) = pre_postprocess_data
@@ -1916,7 +2103,7 @@ fn send_screencopy_result<'a>(
                         .map(|rect| Rectangle::new(rect.loc - cursor_geometry.loc, rect.size))
                         .collect::<Vec<_>>();
                     let mut frame = renderer.render(fb, output_size, output_transform).map_err(
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering,
                     )?;
                     frame
                         .as_mut()
@@ -1936,15 +2123,15 @@ fn send_screencopy_result<'a>(
                             Transform::Normal,
                             1.0,
                         )
-                        .map_err(GlMultiError::Render)
+                        .map_err(GlesMultiError::Render)
                         .map_err(
-                            RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                            RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering,
                         )?;
                     let sync = frame.finish().map_err(
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering,
                     )?;
                     renderer.wait(&sync).map_err(
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering,
+                        RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering,
                     )?;
                 }
             } else {
@@ -1963,10 +2150,10 @@ fn send_screencopy_result<'a>(
                 )
                 .map_err(|err| match err {
                     BlitFrameResultError::Rendering(err) => {
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                        RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering(err)
                     }
                     BlitFrameResultError::Export(_) => {
-                        RenderError::<<GlMultiRenderer as RendererSuper>::Error>::Rendering(
+                        RenderError::<<GlesMultiRenderer as RendererSuper>::Error>::Rendering(
                             MultiError::DeviceMissing,
                         )
                     }
@@ -1985,6 +2172,12 @@ fn send_screencopy_result<'a>(
         sync,
         // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
         vec![],
+        CaptureSessionRef::Session(session.clone()),
+        // This runs on `SurfaceThreadState`'s event loop, not `State`'s, so the vulkan SHM-copy
+        // deferral (which needs `&mut State`) is unavailable here; `false` keeps the original
+        // eager/blocking copy for this path, matching the output-capture path in render/mod.rs.
+        None,
+        false,
     )? {
         if frame_result.is_empty {
             data.frame
@@ -1997,14 +2190,13 @@ fn send_screencopy_result<'a>(
     Ok(())
 }
 
-#[cfg(not(feature = "renderer_vulkan"))]
 fn postprocess_elements<'a>(
-    renderer: &mut GlMultiRenderer<'a>,
+    renderer: &mut GlesMultiRenderer<'a>,
     output: &Output,
     pre_postprocess_data: &PrePostprocessData,
     postprocess_state: &PostprocessState,
     screen_filter: &ScreenFilter,
-) -> Vec<CosmicElement<GlMultiRenderer<'a>>> {
+) -> Vec<CosmicElement<GlesMultiRenderer<'a>>> {
     let postprocess_texture_shader = Borrow::<GlesRenderer>::borrow(renderer.as_ref())
         .egl_context()
         .user_data()
@@ -2096,6 +2288,6 @@ fn postprocess_elements<'a>(
         ConstrainAlign::CENTER,
         postprocess_state.output_config.fractional_scale,
     )
-    .map(CosmicElement::<GlMultiRenderer>::Postprocess)
+    .map(CosmicElement::<GlesMultiRenderer>::Postprocess)
     .collect::<Vec<_>>()
 }

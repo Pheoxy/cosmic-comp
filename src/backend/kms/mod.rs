@@ -15,17 +15,15 @@ use calloop::{
 };
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputState};
 use indexmap::IndexMap;
-use render::KmsGraphics;
-#[cfg(not(feature = "renderer_vulkan"))]
-use render::gles::GbmGlowBackend;
+use render::{KmsApi, KmsBackendKind};
 use smithay::{
     backend::{
         allocator::{Buffer, dmabuf::Dmabuf, format::FormatSet},
-        drm::{DrmDeviceFd, DrmNode, NodeType, VrrSupport, output::DrmOutputRenderElements},
+        drm::{DrmNode, NodeType, VrrSupport, output::DrmOutputRenderElements},
         egl::{EGLContext, EGLDevice, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{glow::GlowRenderer, multigpu::GpuManager},
+        renderer::glow::GlowRenderer,
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, primary_gpu},
     },
@@ -78,7 +76,7 @@ pub struct KmsState {
     pub primary_node: Arc<RwLock<Option<DrmNode>>>,
     // Mesa llvmpipe renderer, if supported and there are no render nodes
     pub software_renderer: Option<GlowRenderer>,
-    pub api: GpuManager<KmsGraphics>,
+    pub api: KmsApi,
 
     pub session: LibSeatSession,
     libinput: Libinput,
@@ -92,7 +90,7 @@ pub struct KmsState {
 pub struct KmsGuard<'a> {
     pub drm_devices: IndexMap<DrmNode, LockedDevice<'a>>,
     pub primary_node: Arc<RwLock<Option<DrmNode>>>,
-    api: &'a mut GpuManager<KmsGraphics>,
+    api: &'a mut KmsApi,
     session: &'a LibSeatSession,
 }
 
@@ -138,30 +136,7 @@ pub fn init_backend(
         input_devices: HashMap::new(),
         primary_node: Arc::new(RwLock::new(None)),
         software_renderer: None,
-        api: {
-            #[cfg(not(feature = "renderer_vulkan"))]
-            {
-                GpuManager::new(GbmGlowBackend::new())
-                    .context("Failed to initialize gpu backend")?
-            }
-            #[cfg(feature = "renderer_vulkan")]
-            {
-                use smithay::backend::{
-                    renderer::multigpu::vulkan::VulkanGbmBackend,
-                    vulkan::{Instance, version::Version},
-                };
-                // Default loader enumerates every ICD, including NVIDIA. That is required
-                // for HDMI on the dGPU. If RM is still in kgspInitRm, this ioctl can D-state
-                // the compositor; skip the dGPU with COSMIC_DRM_BLOCK_DEVICES=0x10de:0x249d
-                // rather than filtering ICDs (that would also lose NVIDIA scanout).
-                let instance = Instance::new(Version::VERSION_1_3, None)
-                    .context("Failed to create Vulkan instance")?;
-                GpuManager::new(
-                    VulkanGbmBackend::new(instance).with_wayland_linux_dmabuf_interop(true),
-                )
-                .context("Failed to initialize Vulkan gpu backend")?
-            }
-        },
+        api: KmsApi::new(KmsBackendKind::selected())?,
 
         session,
         libinput: libinput_context,
@@ -560,23 +535,23 @@ impl State {
                     node
                 ))?;
 
-            #[cfg(not(feature = "renderer_vulkan"))]
-            if let Some(drm) = self.common.wl_drm_state.as_mut() {
-                drm.update_device(device_path, primary_formats);
-            } else {
-                self.common.wl_drm_state = Some(WlDrmState::new::<State>(
-                    dh,
-                    device_path,
-                    primary_formats,
-                    kms.dmabuf_global.as_ref().unwrap(),
-                ));
+            // The legacy WL_DRM protocol is GLES/EGL-only; Vulkan clients never negotiate it.
+            if kms.api.kind() == KmsBackendKind::Gles {
+                if let Some(drm) = self.common.wl_drm_state.as_mut() {
+                    drm.update_device(device_path, primary_formats);
+                } else {
+                    self.common.wl_drm_state = Some(WlDrmState::new::<State>(
+                        dh,
+                        device_path,
+                        primary_formats,
+                        kms.dmabuf_global.as_ref().unwrap(),
+                    ));
+                }
             }
-            #[cfg(feature = "renderer_vulkan")]
-            let _ = (device_path, primary_formats);
         } else if kms.software_renderer.is_none() {
             info!("Failed to find a suitable gpu, using software renderingr");
-            #[cfg(not(feature = "renderer_vulkan"))]
-            {
+            // The llvmpipe software-rendering fallback is GLES/EGL-only.
+            if kms.api.kind() == KmsBackendKind::Gles {
                 kms.software_renderer = match software_renderer() {
                     Ok(renderer) => Some(renderer),
                     Err(err) => {
@@ -727,39 +702,38 @@ impl KmsState {
             let new = device.inner.active_clients.insert(client.id());
             device.inner.update_egl(
                 self.primary_node.read().unwrap().as_ref(),
-                self.api.as_mut(),
+                &mut self.api,
             )? && new
         } else {
             false
         };
 
-        #[cfg(not(feature = "renderer_vulkan"))]
-        {
-            let egl = device
-                .inner
-                .egl
-                .as_ref()
-                .context("EGL initialization Error")?;
-            egl.display
-                .create_image_from_dmabuf(&dmabuf)
-                .inspect(|image| unsafe {
-                    smithay::backend::egl::ffi::egl::DestroyImageKHR(
-                        **egl.display.get_display_handle(),
-                        *image,
-                    );
-                })
-                .context("Failed to create EGLImage from dmabuf")?;
-        }
-        #[cfg(feature = "renderer_vulkan")]
-        {
-            let renderer = self
-                .api
-                .single_renderer(&device.inner.render_node)
-                .context("Vulkan renderer missing for dmabuf admit")?;
-            anyhow::ensure!(
-                renderer.as_ref().sampled_dmabuf_import_supported(&dmabuf),
-                "sampled dmabuf not supported on Vulkan renderer"
-            );
+        match &mut self.api {
+            KmsApi::Gles(_) => {
+                let egl = device
+                    .inner
+                    .egl
+                    .as_ref()
+                    .context("EGL initialization Error")?;
+                egl.display
+                    .create_image_from_dmabuf(&dmabuf)
+                    .inspect(|image| unsafe {
+                        smithay::backend::egl::ffi::egl::DestroyImageKHR(
+                            **egl.display.get_display_handle(),
+                            *image,
+                        );
+                    })
+                    .context("Failed to create EGLImage from dmabuf")?;
+            }
+            KmsApi::Vulkan(api) => {
+                let renderer = api
+                    .single_renderer(&device.inner.render_node)
+                    .context("Vulkan renderer missing for dmabuf admit")?;
+                anyhow::ensure!(
+                    renderer.as_ref().sampled_dmabuf_import_supported(&dmabuf),
+                    "sampled dmabuf not supported on Vulkan renderer"
+                );
+            }
         }
 
         let node = device.inner.render_node;
@@ -812,14 +786,14 @@ impl KmsState {
 
         for device in self.drm_devices.values_mut() {
             if device.inner.egl.take().is_some() {
-                self.api.as_mut().remove_node(&device.inner.render_node);
+                self.api.remove_node(&device.inner.render_node);
                 device.inner.update_surface_nodes(&empty_devices, &[])?;
             }
         }
 
         // trigger re-evaluation... urgh
         if let Some(primary_node) = primary_node.as_ref() {
-            let _ = self.api.single_renderer(primary_node);
+            self.api.trigger_enumeration(primary_node);
         }
 
         Ok(())
@@ -832,7 +806,7 @@ impl KmsState {
         for device in self.drm_devices.values_mut() {
             if device
                 .inner
-                .update_egl(primary_node.as_ref(), self.api.as_mut())?
+                .update_egl(primary_node.as_ref(), &mut self.api)?
             {
                 used_devices.insert(device.inner.render_node);
             }
@@ -840,7 +814,7 @@ impl KmsState {
 
         // trigger re-evaluation... urgh
         if let Some(primary_node) = primary_node.as_ref() {
-            let _ = self.api.single_renderer(primary_node);
+            self.api.trigger_enumeration(primary_node);
         }
 
         // I hate this. I want partial borrows of hashmap values
@@ -894,7 +868,7 @@ impl KmsGuard<'_> {
         for device in self.drm_devices.values_mut() {
             if device
                 .inner
-                .update_egl(primary_node.as_ref(), self.api.as_mut())?
+                .update_egl(primary_node.as_ref(), &mut *self.api)?
             {
                 used_devices.insert(device.inner.render_node);
             }
@@ -902,7 +876,7 @@ impl KmsGuard<'_> {
 
         // trigger re-evaluation... urgh
         if let Some(primary_node) = primary_node.as_ref() {
-            let _ = self.api.single_renderer(primary_node);
+            self.api.trigger_enumeration(primary_node);
         }
 
         // I hate this. I want partial borrows of hashmap values
@@ -1146,44 +1120,83 @@ impl KmsGuard<'_> {
                             planes.cursor = vec![];
                         }
 
-                        let compositor: GbmDrmOutput = {
-                            let mut renderer = self
-                                .api
-                                .single_renderer(&device.inner.render_node)
-                                .with_context(|| "Failed to create renderer")?;
+                        let compositor: GbmDrmOutput = match &mut self.api {
+                            KmsApi::Gles(api) => {
+                                let mut renderer = api
+                                    .single_renderer(&device.inner.render_node)
+                                    .with_context(|| "Failed to create renderer")?;
 
-                            let mut elements = DrmOutputRenderElements::default();
-                            for (crtc, output) in output_map.iter() {
-                                let output_elements = output_elements(
-                                    Some(&device.inner.render_node),
-                                    &mut renderer,
-                                    &shell,
-                                    now,
-                                    output,
-                                    CursorMode::All,
-                                    None,
-                                    None,
-                                )
-                                .with_context(|| "Failed to render outputs")?;
+                                let mut elements = DrmOutputRenderElements::default();
+                                for (crtc, output) in output_map.iter() {
+                                    let output_elements = output_elements(
+                                        Some(&device.inner.render_node),
+                                        &mut renderer,
+                                        &shell,
+                                        now,
+                                        output,
+                                        CursorMode::All,
+                                        None,
+                                        None,
+                                    )
+                                    .with_context(|| "Failed to render outputs")?;
 
-                                elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                                    elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                                }
+
+                                let compositor = drm
+                                    .initialize_output(
+                                        *crtc,
+                                        *mode,
+                                        &[conn],
+                                        &surface.output,
+                                        Some(planes.clone()),
+                                        &mut renderer,
+                                        &elements,
+                                    )
+                                    .with_context(|| "Failed to create drm surface")?;
+
+                                let _ = renderer;
+
+                                compositor
                             }
+                            KmsApi::Vulkan(api) => {
+                                let mut renderer = api
+                                    .single_renderer(&device.inner.render_node)
+                                    .with_context(|| "Failed to create renderer")?;
 
-                            let compositor = drm
-                                .initialize_output(
-                                    *crtc,
-                                    *mode,
-                                    &[conn],
-                                    &surface.output,
-                                    Some(planes.clone()),
-                                    &mut renderer,
-                                    &elements,
-                                )
-                                .with_context(|| "Failed to create drm surface")?;
+                                let mut elements = DrmOutputRenderElements::default();
+                                for (crtc, output) in output_map.iter() {
+                                    let output_elements = output_elements(
+                                        Some(&device.inner.render_node),
+                                        &mut renderer,
+                                        &shell,
+                                        now,
+                                        output,
+                                        CursorMode::All,
+                                        None,
+                                        None,
+                                    )
+                                    .with_context(|| "Failed to render outputs")?;
 
-                            let _ = renderer;
+                                    elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                                }
 
-                            compositor
+                                let compositor = drm
+                                    .initialize_output(
+                                        *crtc,
+                                        *mode,
+                                        &[conn],
+                                        &surface.output,
+                                        Some(planes.clone()),
+                                        &mut renderer,
+                                        &elements,
+                                    )
+                                    .with_context(|| "Failed to create drm surface")?;
+
+                                let _ = renderer;
+
+                                compositor
+                            }
                         };
 
                         if let Some(bpc) = output_config.0.max_bpc
@@ -1258,10 +1271,73 @@ impl KmsGuard<'_> {
                             surface.output.set_adaptive_sync(vrr);
                         }
 
-                        let mut renderer = self
-                            .api
+                        match &mut self.api {
+                            KmsApi::Gles(api) => {
+                                let mut elements = DrmOutputRenderElements::default();
+                                let mut renderer = api
+                                    .single_renderer(&device.inner.render_node)
+                                    .with_context(|| "Failed to create renderer")?;
+                                for (crtc, output) in output_map.iter() {
+                                    let output_elements = output_elements(
+                                        Some(&device.inner.render_node),
+                                        &mut renderer,
+                                        &shell,
+                                        now,
+                                        output,
+                                        CursorMode::All,
+                                        None,
+                                        None,
+                                    )
+                                    .with_context(|| "Failed to render outputs")?;
+                                    elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                                }
+                                drm.use_mode(&surface.crtc, *mode, &mut renderer, &elements)
+                                    .context("Failed to apply new mode")?;
+                            }
+                            KmsApi::Vulkan(api) => {
+                                let mut elements = DrmOutputRenderElements::default();
+                                let mut renderer = api
+                                    .single_renderer(&device.inner.render_node)
+                                    .with_context(|| "Failed to create renderer")?;
+                                for (crtc, output) in output_map.iter() {
+                                    let output_elements = output_elements(
+                                        Some(&device.inner.render_node),
+                                        &mut renderer,
+                                        &shell,
+                                        now,
+                                        output,
+                                        CursorMode::All,
+                                        None,
+                                        None,
+                                    )
+                                    .with_context(|| "Failed to render outputs")?;
+                                    elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                                }
+                                drm.use_mode(&surface.crtc, *mode, &mut renderer, &elements)
+                                    .context("Failed to apply new mode")?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // configure primary scanout allowance
+            if !device.inner.surfaces.is_empty() {
+                let allow = device
+                    .inner
+                    .surfaces
+                    .values()
+                    .filter(|s| s.output.is_enabled() && s.output.mirroring().is_none())
+                    .count()
+                    <= 1;
+                match &mut self.api {
+                    KmsApi::Gles(api) => {
+                        let mut renderer = api
                             .single_renderer(&device.inner.render_node)
                             .with_context(|| "Failed to create renderer")?;
+                        device
+                            .allow_primary_scanout_any(allow, &mut renderer, clock, &shell)
+                            .context("Failed to switch primary-plane scanout flags")?;
 
                         let mut elements = DrmOutputRenderElements::default();
                         for (crtc, output) in output_map.iter() {
@@ -1280,56 +1356,43 @@ impl KmsGuard<'_> {
                             elements.add_output(crtc, CLEAR_COLOR, output_elements);
                         }
 
-                        drm.use_mode(&surface.crtc, *mode, &mut renderer, &elements)
-                            .context("Failed to apply new mode")?;
+                        if let Err(err) =
+                            device.drm.try_to_restore_modifiers(&mut renderer, &elements)
+                        {
+                            warn!(?err, "Failed to restore modifiers");
+                        }
                     }
-                }
-            }
-
-            // configure primary scanout allowance
-            if !device.inner.surfaces.is_empty() {
-                let mut renderer = self
-                    .api
-                    .single_renderer(&device.inner.render_node)
-                    .with_context(|| "Failed to create renderer")?;
-
-                device
-                    .allow_primary_scanout_any(
+                    KmsApi::Vulkan(api) => {
+                        let mut renderer = api
+                            .single_renderer(&device.inner.render_node)
+                            .with_context(|| "Failed to create renderer")?;
                         device
-                            .inner
-                            .surfaces
-                            .values()
-                            .filter(|s| s.output.is_enabled() && s.output.mirroring().is_none())
-                            .count()
-                            <= 1,
-                        &mut renderer,
-                        clock,
-                        &shell,
-                    )
-                    .context("Failed to switch primary-plane scanout flags")?;
+                            .allow_primary_scanout_any(allow, &mut renderer, clock, &shell)
+                            .context("Failed to switch primary-plane scanout flags")?;
 
-                let mut elements = DrmOutputRenderElements::default();
-                for (crtc, output) in output_map.iter() {
-                    let output_elements = output_elements(
-                        Some(&device.inner.render_node),
-                        &mut renderer,
-                        &shell,
-                        now,
-                        output,
-                        CursorMode::All,
-                        None,
-                        None,
-                    )
-                    .with_context(|| "Failed to render outputs")?;
+                        let mut elements = DrmOutputRenderElements::default();
+                        for (crtc, output) in output_map.iter() {
+                            let output_elements = output_elements(
+                                Some(&device.inner.render_node),
+                                &mut renderer,
+                                &shell,
+                                now,
+                                output,
+                                CursorMode::All,
+                                None,
+                                None,
+                            )
+                            .with_context(|| "Failed to render outputs")?;
 
-                    elements.add_output(crtc, CLEAR_COLOR, output_elements);
-                }
+                            elements.add_output(crtc, CLEAR_COLOR, output_elements);
+                        }
 
-                if let Err(err) = device
-                    .drm
-                    .try_to_restore_modifiers(&mut renderer, &elements)
-                {
-                    warn!(?err, "Failed to restore modifiers");
+                        if let Err(err) =
+                            device.drm.try_to_restore_modifiers(&mut renderer, &elements)
+                        {
+                            warn!(?err, "Failed to restore modifiers");
+                        }
+                    }
                 }
             }
         }

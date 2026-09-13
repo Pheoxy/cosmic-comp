@@ -2,11 +2,11 @@
 
 use crate::{
     backend::{
-        kms::render::KmsGraphics,
-        render::{CLEAR_COLOR, CursorMode, GlMultiRenderer, init_shaders, output_elements},
+        kms::render::{KmsApi, KmsBackendKind},
+        render::{CLEAR_COLOR, CursorMode, element::AsGlowRenderer, init_shaders, output_elements},
     },
     config::{CompTransformDef, EdidProduct, ScreenFilter},
-    shell::Shell,
+    shell::{CosmicMappedRenderElement, Shell, WorkspaceRenderElement},
     utils::{env::dev_list_var, prelude::*},
     wayland::handlers::image_copy_capture::PendingImageCopyData,
 };
@@ -17,6 +17,7 @@ use smithay::{
     backend::{
         allocator::{
             Format, Fourcc,
+            dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmDevice},
         },
@@ -27,7 +28,7 @@ use smithay::{
             output::{DrmOutputManager, LockedDrmOutputManager},
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
-        renderer::glow::GlowRenderer,
+        renderer::{RenderTargetLifecycle, Texture, element::RenderElement, glow::GlowRenderer},
         session::{Session, libseat::LibSeatSession},
     },
     desktop::utils::OutputPresentationFeedback,
@@ -419,9 +420,9 @@ impl State {
             }
 
             // These contain a reference to the file descriptor
-            backend.api.as_mut().remove_node(&device.inner.render_node);
+            backend.api.remove_node(&device.inner.render_node);
             // trigger enumeration
-            let _ = backend.api.devices();
+            backend.api.trigger_devices_enumeration();
 
             for surface in backend
                 .drm_devices
@@ -617,7 +618,7 @@ impl State {
             if let Some(token) = device.event_token.take() {
                 self.common.event_loop_handle.remove(token);
             }
-            backend.api.as_mut().remove_node(&device.inner.render_node);
+            backend.api.remove_node(&device.inner.render_node);
             backend
                 .primary_node
                 .write()
@@ -707,9 +708,9 @@ impl Device {
 
         let gbm = GbmDevice::new(fd)
             .with_context(|| format!("Failed to initialize GBM device for {}", path.display()))?;
-        let (render_node, render_formats, texture_formats, is_software) = {
-            #[cfg(not(feature = "renderer_vulkan"))]
-            {
+        let (render_node, render_formats, texture_formats, is_software) = match KmsBackendKind::selected()
+        {
+            KmsBackendKind::Gles => {
                 let egl = init_egl(&gbm)?;
 
                 let render_node = egl
@@ -728,8 +729,7 @@ impl Device {
                     egl.device.is_software(),
                 )
             }
-            #[cfg(feature = "renderer_vulkan")]
-            {
+            KmsBackendKind::Vulkan => {
                 use smithay::backend::{
                     allocator::dmabuf::Dmabuf,
                     renderer::{
@@ -920,14 +920,23 @@ impl Device {
 }
 
 impl LockedDevice<'_> {
-    fn allow_frame_flags(
+    fn allow_frame_flags<R>(
         &mut self,
         flag: bool,
         flags: FrameFlags,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: AsGlowRenderer,
+        R::Error: Send + Sync + 'static,
+        R: RenderTargetLifecycle<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::TextureId: Send + Clone + 'static,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         for surface in self.inner.surfaces.values_mut() {
             surface.allow_frame_flags(flag, flags);
         }
@@ -971,13 +980,22 @@ impl LockedDevice<'_> {
         Ok(())
     }
 
-    pub fn allow_overlay_scanout(
+    pub fn allow_overlay_scanout<R>(
         &mut self,
         flag: bool,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: AsGlowRenderer,
+        R::Error: Send + Sync + 'static,
+        R: RenderTargetLifecycle<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::TextureId: Send + Clone + 'static,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         self.allow_frame_flags(
             flag,
             FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT,
@@ -987,13 +1005,22 @@ impl LockedDevice<'_> {
         )
     }
 
-    pub fn allow_primary_scanout_any(
+    pub fn allow_primary_scanout_any<R>(
         &mut self,
         flag: bool,
-        renderer: &mut GlMultiRenderer,
+        renderer: &mut R,
         clock: &Clock<Monotonic>,
         shell: &Arc<parking_lot::RwLock<Shell>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: AsGlowRenderer,
+        R::Error: Send + Sync + 'static,
+        R: RenderTargetLifecycle<Dmabuf>,
+        R::TextureId: Texture + 'static,
+        R::TextureId: Send + Clone + 'static,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        WorkspaceRenderElement<R>: RenderElement<R>,
+    {
         self.allow_frame_flags(
             flag,
             FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
@@ -1134,42 +1161,38 @@ impl InnerDevice {
         }
     }
 
-    pub fn update_egl(
-        &mut self,
-        primary_node: Option<&DrmNode>,
-        api: &mut KmsGraphics,
-    ) -> Result<bool> {
+    pub fn update_egl(&mut self, primary_node: Option<&DrmNode>, api: &mut KmsApi) -> Result<bool> {
         if self.in_use(primary_node) {
             if !self.renderer_bound {
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let egl = init_egl(&self.gbm).context("Failed to create EGL context")?;
-                    let mut renderer = unsafe {
-                        GlowRenderer::new(
-                            EGLContext::new_shared_with_priority(
-                                &egl.display,
-                                &egl.context,
-                                ContextPriority::High,
+                match api {
+                    KmsApi::Gles(api) => {
+                        let egl = init_egl(&self.gbm).context("Failed to create EGL context")?;
+                        let mut renderer = unsafe {
+                            GlowRenderer::new(
+                                EGLContext::new_shared_with_priority(
+                                    &egl.display,
+                                    &egl.context,
+                                    ContextPriority::High,
+                                )
+                                .context("Failed to create shared EGL context")?,
                             )
-                            .context("Failed to create shared EGL context")?,
-                        )
-                        .context("Failed to create GL renderer")?
-                    };
-                    init_shaders(renderer.borrow_mut()).context("Failed to compile shaders")?;
-                    api.add_node(
-                        self.render_node,
-                        GbmAllocator::new(
-                            self.gbm.clone(),
-                            // SCANOUT because stride bugs
-                            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-                        ),
-                        renderer,
-                    );
-                    self.egl = Some(egl);
-                }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    api.add_node(self.render_node, self.gbm.clone());
+                            .context("Failed to create GL renderer")?
+                        };
+                        init_shaders(renderer.borrow_mut()).context("Failed to compile shaders")?;
+                        api.as_mut().add_node(
+                            self.render_node,
+                            GbmAllocator::new(
+                                self.gbm.clone(),
+                                // SCANOUT because stride bugs
+                                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                            ),
+                            renderer,
+                        );
+                        self.egl = Some(egl);
+                    }
+                    KmsApi::Vulkan(api) => {
+                        api.as_mut().add_node(self.render_node, self.gbm.clone());
+                    }
                 }
                 self.renderer_bound = true;
             }
@@ -1208,37 +1231,33 @@ impl InnerDevice {
                     (device.render_node, device.gbm.clone())
                 };
 
-                #[cfg(not(feature = "renderer_vulkan"))]
-                {
-                    let egl = if self.render_node == *new_device {
-                        self.egl.as_ref().unwrap()
-                    } else {
-                        others
-                            .iter()
-                            .find(|d| d.render_node == *new_device)
-                            .unwrap()
-                            .egl
-                            .as_ref()
-                            .unwrap()
-                    };
-                    surface.add_node(
-                        render_node,
-                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
-                        EGLContext::new_shared_with_priority(
-                            &egl.display,
-                            &egl.context,
-                            ContextPriority::High,
-                        )
-                        .context("Failed to create shared EGL context")?,
-                    );
+                // `egl` is only ever `Some` on devices `update_egl` bound under the GLES backend;
+                // Vulkan devices never populate it, so `None` here means "this is a Vulkan node"
+                // just as reliably as checking `KmsApi`'s variant would.
+                let egl = if self.render_node == *new_device {
+                    self.egl.as_ref()
+                } else {
+                    others
+                        .iter()
+                        .find(|d| d.render_node == *new_device)
+                        .unwrap()
+                        .egl
+                        .as_ref()
                 }
-                #[cfg(feature = "renderer_vulkan")]
-                {
-                    surface.add_node(
-                        render_node,
-                        GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
-                    );
-                }
+                .map(|egl| {
+                    EGLContext::new_shared_with_priority(
+                        &egl.display,
+                        &egl.context,
+                        ContextPriority::High,
+                    )
+                    .context("Failed to create shared EGL context")
+                })
+                .transpose()?;
+                surface.add_node(
+                    render_node,
+                    GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT),
+                    egl,
+                );
             }
         }
 
