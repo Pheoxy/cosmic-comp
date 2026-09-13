@@ -106,8 +106,8 @@ pub fn screenshot_window(state: &mut State, surface: &CosmicSurface) {
             .with_context(|| "Failed to get renderer for screenshot")
             .and_then(|renderer| match renderer {
                 RendererRef::Glow(renderer) => render_window(renderer, surface),
-                RendererRef::GlMultiGles(mut renderer) => render_window(&mut renderer, surface),
-                RendererRef::GlMultiVulkan(_) => {
+                RendererRef::MultiGles(mut renderer) => render_window(&mut renderer, surface),
+                RendererRef::MultiVulkan(_) => {
                     anyhow::bail!("window screenshot needs a GLES offscreen target")
                 }
             });
