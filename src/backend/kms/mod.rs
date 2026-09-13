@@ -59,6 +59,7 @@ use std::{
     time::Duration,
 };
 
+mod color;
 mod device;
 mod drm_helpers;
 pub mod render;
