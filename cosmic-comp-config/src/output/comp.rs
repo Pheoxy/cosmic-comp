@@ -73,6 +73,25 @@ pub struct OutputInfo {
     pub connector: String,
     pub make: String,
     pub model: String,
+    /// EDID-derived serial (product serial string or numeric serial), when the
+    /// display reports one.
+    ///
+    /// This is a best-effort identity hint, not a guaranteed-unique key:
+    /// - Some panels (e.g. internal `eDP` displays) have no serial descriptor
+    ///   at all.
+    /// - Some external displays reuse a manufacturer-default numeric serial
+    ///   (e.g. `0x01010101`) that is identical across every unit of that
+    ///   model, so it must not be trusted as unique without also checking it
+    ///   actually disambiguates the currently-connected outputs.
+    /// - libdisplay-info's own docs describe this value as "informational
+    ///   and not meant to be used in programmatic decisions" - so it must
+    ///   always be used as a hint alongside `connector`/`make`/`model`, with
+    ///   graceful fallback when absent or ambiguous, never as a sole key.
+    ///
+    /// `#[serde(default)]` so `outputs.ron` files written before this field
+    /// existed keep deserializing (they simply get `None` here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 pub fn load_outputs(path: Option<impl AsRef<Path>>) -> OutputsConfig {
@@ -134,4 +153,107 @@ pub enum TransformDef {
     Flipped90,
     Flipped180,
     Flipped270,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Shaped like a real `outputs.ron` written before the `serial` field on
+    // `OutputInfo` existed (connector/make/model only, no `serial` key at
+    // all). Loading it must not lose the saved layout, and every entry must
+    // come back with `serial: None`. Vendor/model strings here are
+    // placeholders, not real EDID data.
+    const PRE_SERIAL_FIELD_OUTPUTS_RON: &str = r#"(
+    config: {
+        [
+            (
+                connector: "DP-3",
+                make: "Example Display Co",
+                model: "EX2740Q",
+            ),
+            (
+                connector: "eDP-1",
+                make: "Example Panel Corp",
+                model: "0x0000",
+            ),
+        ]: [
+            (
+                mode: ((2560, 1440), Some(59951)),
+                vrr: r#false,
+                scale: 1.0,
+                transform: Normal,
+                position: (1920, 0),
+                enabled: r#true,
+                max_bpc: Some(12),
+                xwayland_primary: false,
+            ),
+            (
+                mode: ((1920, 1080), Some(144000)),
+                vrr: r#false,
+                scale: 1.0,
+                transform: Normal,
+                position: (0, 0),
+                enabled: r#true,
+                xwayland_primary: true,
+            ),
+        ],
+    },
+)"#;
+
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cosmic-comp-config-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn pre_serial_field_outputs_ron_still_loads() {
+        let path = scratch_path("pre-serial.ron");
+        std::fs::write(&path, PRE_SERIAL_FIELD_OUTPUTS_RON).unwrap();
+
+        let config = load_outputs(Some(&path));
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(config.config.len(), 1, "the one saved layout must survive");
+        let (infos, outputs) = config.config.iter().next().unwrap();
+        assert_eq!(infos.len(), 2);
+        assert!(
+            infos.iter().all(|info| info.serial.is_none()),
+            "entries written before the `serial` field existed must deserialize to `None`, not fail/reset: {:?}",
+            infos
+        );
+        assert_eq!(outputs.len(), 2);
+    }
+
+    #[test]
+    fn serial_round_trips_through_ron() {
+        let path = scratch_path("with-serial.ron");
+        let mut config = OutputsConfig {
+            config: HashMap::new(),
+        };
+        config.config.insert(
+            vec![OutputInfo {
+                connector: "DP-3".into(),
+                make: "Example Display Co".into(),
+                model: "EX2740Q".into(),
+                serial: Some("EXAMPLE-SERIAL-0001".into()),
+            }],
+            vec![OutputConfig::default()],
+        );
+        std::fs::write(&path, ron::ser::to_string_pretty(&config, Default::default()).unwrap())
+            .unwrap();
+
+        let loaded = load_outputs(Some(&path));
+        std::fs::remove_file(&path).unwrap();
+
+        let (infos, _) = loaded.config.iter().next().unwrap();
+        assert_eq!(infos[0].serial.as_deref(), Some("EXAMPLE-SERIAL-0001"));
+    }
 }
