@@ -435,20 +435,24 @@ impl BackendData {
                 let Some(node) = *kms.primary_node.read().unwrap() else {
                     return;
                 };
-                match kms.api.single_renderer(&node) {
-                    Ok(mut renderer) => {
-                        if let Err(err) =
+                let result = match &mut kms.api {
+                    crate::backend::kms::render::KmsApi::Gles(api) => api
+                        .single_renderer(&node)
+                        .map_err(|err| err.to_string())
+                        .and_then(|mut renderer| {
                             retire_and_release_surface_tree_textures(&mut renderer, surface)
-                        {
-                            warn!(?err, "Failed to release retired surface textures");
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            "Failed to get KMS renderer for surface texture release"
-                        )
-                    }
+                                .map_err(|err| err.to_string())
+                        }),
+                    crate::backend::kms::render::KmsApi::Vulkan(api) => api
+                        .single_renderer(&node)
+                        .map_err(|err| err.to_string())
+                        .and_then(|mut renderer| {
+                            retire_and_release_surface_tree_textures(&mut renderer, surface)
+                                .map_err(|err| err.to_string())
+                        }),
+                };
+                if let Err(err) = result {
+                    warn!(err, "Failed to release retired surface textures");
                 }
             }
             BackendData::Winit(state) => {
@@ -535,7 +539,7 @@ impl BackendData {
             BackendData::Kms(kms) => {
                 if let Some(nodes) = kms_node_cb(kms) {
                     let nodes = nodes.into();
-                    Ok(RendererRef::GlMulti(kms.api.renderer(
+                    Ok(RendererRef::GlMulti(kms.api.expect_compile_time_backend().renderer(
                         &nodes.render_node,
                         &nodes.target_node,
                         nodes.copy_format,

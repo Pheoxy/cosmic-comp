@@ -32,23 +32,26 @@ impl DrmLeaseHandler for State {
             .get_mut(&node)
             .ok_or(LeaseRejected::default())?
             .lock();
-        let mut renderer = match kms.api.single_renderer(&backend.inner.render_node) {
-            Ok(renderer) => renderer,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "Failed to create renderer to disable direct scanout, denying lease"
-                );
-                return Err(LeaseRejected::default());
+        let scanout_result = match &mut kms.api {
+            crate::backend::kms::render::KmsApi::Gles(api) => {
+                match api.single_renderer(&backend.inner.render_node) {
+                    Ok(mut renderer) => backend
+                        .allow_overlay_scanout(false, &mut renderer, &self.common.clock, &self.common.shell)
+                        .map_err(|err| err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            crate::backend::kms::render::KmsApi::Vulkan(api) => {
+                match api.single_renderer(&backend.inner.render_node) {
+                    Ok(mut renderer) => backend
+                        .allow_overlay_scanout(false, &mut renderer, &self.common.clock, &self.common.shell)
+                        .map_err(|err| err.to_string()),
+                    Err(err) => Err(err.to_string()),
+                }
             }
         };
-        if let Err(err) = backend.allow_overlay_scanout(
-            false,
-            &mut renderer,
-            &self.common.clock,
-            &self.common.shell,
-        ) {
-            tracing::warn!(?err, "Failed to disable direct scanout");
+        if let Err(err) = scanout_result {
+            tracing::warn!(err, "Failed to disable direct scanout");
             return Err(LeaseRejected::default());
         }
 
@@ -114,20 +117,26 @@ impl DrmLeaseHandler for State {
             backend.inner.active_leases.retain(|l| l.id() != lease);
 
             if backend.inner.active_leases.is_empty() {
-                let mut renderer = match kms.api.single_renderer(&backend.inner.render_node) {
-                    Ok(renderer) => renderer,
-                    Err(err) => {
-                        tracing::warn!(?err, "Failed to create renderer to enable direct scanout.");
-                        return;
+                let scanout_result = match &mut kms.api {
+                    crate::backend::kms::render::KmsApi::Gles(api) => {
+                        match api.single_renderer(&backend.inner.render_node) {
+                            Ok(mut renderer) => backend
+                                .allow_overlay_scanout(true, &mut renderer, &self.common.clock, &self.common.shell)
+                                .map_err(|err| err.to_string()),
+                            Err(err) => Err(err.to_string()),
+                        }
+                    }
+                    crate::backend::kms::render::KmsApi::Vulkan(api) => {
+                        match api.single_renderer(&backend.inner.render_node) {
+                            Ok(mut renderer) => backend
+                                .allow_overlay_scanout(true, &mut renderer, &self.common.clock, &self.common.shell)
+                                .map_err(|err| err.to_string()),
+                            Err(err) => Err(err.to_string()),
+                        }
                     }
                 };
-                if let Err(err) = backend.allow_overlay_scanout(
-                    true,
-                    &mut renderer,
-                    &self.common.clock,
-                    &self.common.shell,
-                ) {
-                    tracing::warn!(?err, "Failed to enable direct scanout");
+                if let Err(err) = scanout_result {
+                    tracing::warn!(err, "Failed to enable direct scanout");
                 }
             }
         }

@@ -13,7 +13,6 @@ use std::{
 use crate::debug::fps_ui;
 use crate::{
     backend::{
-        kms::render::gles::GbmGlowBackend,
         render::{
             element::DamageElement,
             shadow::{SHADOW_SHADER, ShadowShader},
@@ -1149,8 +1148,7 @@ pub struct PostprocessState {
 }
 
 impl PostprocessState {
-    #[cfg(not(feature = "renderer_vulkan"))]
-    pub fn new_with_renderer<R: AsGlowRenderer>(
+    pub fn new_with_renderer<R: AsGlowRenderer + Offscreen<GlesTexture>>(
         renderer: &mut R,
         format: Fourcc,
         output_config: PostprocessOutputConfig,
@@ -1183,8 +1181,7 @@ impl PostprocessState {
         })
     }
 
-    #[cfg(not(feature = "renderer_vulkan"))]
-    pub fn track_cursor<R: AsGlowRenderer>(
+    pub fn track_cursor<R: AsGlowRenderer + Offscreen<GlesTexture>>(
         &mut self,
         renderer: &mut R,
         format: Fourcc,
