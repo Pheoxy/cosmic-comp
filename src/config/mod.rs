@@ -53,7 +53,8 @@ use cosmic_comp_config::{
     TileBehavior, XkbConfig, XwaylandDescaling, XwaylandEavesdropping, ZoomConfig,
     input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
     output::comp::{
-        OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, load_outputs,
+        OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, find_output_configs,
+        load_outputs,
     },
     workspace::WorkspaceConfig,
 };
@@ -421,11 +422,7 @@ impl Config {
             .collect::<Vec<_>>();
         infos.sort();
 
-        if let Some(configs) = self
-            .dynamic_conf
-            .outputs()
-            .config
-            .get(&infos)
+        if let Some(configs) = find_output_configs(&self.dynamic_conf.outputs().config, &infos)
             .filter(|configs| {
                 if configs
                     .iter()
@@ -442,7 +439,6 @@ impl Config {
                     true
                 }
             })
-            .cloned()
         {
             let known_good_configs = outputs
                 .iter()
