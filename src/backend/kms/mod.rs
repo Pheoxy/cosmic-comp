@@ -955,19 +955,27 @@ impl KmsGuard<'_> {
                 })
                 .copied()
                 .collect::<HashSet<crtc::Handle>>();
+            // Exclude by connector handle, not `Output` identity: `connector_added` (below)
+            // never writes its result back into `device.inner.outputs`, so on any second call
+            // to this function for the same connector, `device.inner.outputs[conn]` can still
+            // be a different `Output` (different `Arc`, since `Output`'s `PartialEq` is
+            // `Arc::ptr_eq`) than the one the first call's `Surface` actually stored - even
+            // though both represent the same physical connector. That let the same enabled,
+            // already-surfaced connector be treated as still "open", paired with a second
+            // still-free crtc (the first crtc is correctly excluded via `free_crtcs` above,
+            // so the second pairing lands on a genuinely different one), and spawn a second
+            // `Surface`/render thread for it that never replaces the first.
             let open_conns = outputs
                 .iter()
-                .filter(|output| {
-                    output.is_enabled()
-                        && !device.inner.surfaces.values().any(|s| &s.output == *output)
-                })
+                .filter(|output| output.is_enabled())
                 .flat_map(|output| {
                     device
                         .inner
                         .outputs
                         .iter()
                         .find_map(|(conn, o)| (output == o).then_some(*conn))
-                });
+                })
+                .filter(|conn| !device.inner.surfaces.values().any(|s| &s.connector == conn));
 
             for conn in open_conns {
                 let conn_info = device
