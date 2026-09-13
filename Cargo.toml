@@ -31,6 +31,10 @@ cosmic-settings-daemon-config = { git = "https://github.com/pop-os/cosmic-settin
 cosmic-text = { version = "0.19", features = [
     "shape-run-cache",
 ] }
+# For uploading a variable-length GAMMA_LUT property blob (its size is a runtime CRTC
+# capability, not known at compile time, so the safe drm::control::Device::create_property_blob
+# generic - which only takes a single fixed-size `&T` - can't express it).
+drm-ffi = "0.9"
 libdisplay-info = "0.3.0"
 egui = { version = "0.31.1", optional = true }
 egui_plot = { version = "0.31.0", optional = true }
