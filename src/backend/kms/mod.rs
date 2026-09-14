@@ -407,6 +407,17 @@ impl State {
             if let Some(lease_state) = device.inner.leasing_global.as_mut() {
                 lease_state.resume::<State>();
             }
+
+            // Re-apply any active CTM/GAMMA_LUT (screen filter, night light) - a VT switch away
+            // and back (or suspend/resume) can lose atomic-managed property state depending on
+            // the driver, same as it can for a surface's own rendering state.
+            for crtc in device.inner.surfaces.keys() {
+                if let Some(props) = backend.color_props.get(crtc)
+                    && props.restore(device.drm.device()).is_none()
+                {
+                    warn!(?crtc, "failed to restore CTM/GAMMA_LUT after session resume");
+                }
+            }
         }
 
         // update state and schedule new render,
@@ -812,9 +823,44 @@ impl KmsState {
     }
 
     pub fn update_screen_filter(&mut self, screen_filter: &ScreenFilter) -> Result<()> {
-        for device in self.drm_devices.values_mut() {
-            for surface in device.inner.surfaces.values_mut() {
-                surface.set_screen_filter(screen_filter.clone());
+        // Try the hardware CTM/GAMMA_LUT path first (backend/kms/color.rs) - renderer-agnostic
+        // and has no per-frame compositing cost, unlike the GLES-only shader path. When it
+        // succeeds for a CRTC, that surface's own ScreenFilterStorage gets a no-op filter so its
+        // (otherwise identical, GLES-only) shader stays idle - the hardware is already producing
+        // the effect below the renderer. Falls back to the shader, with a warning, on any CRTC
+        // that doesn't support CTM/GAMMA_LUT at all, matching GNOME's own hard-capability-gate
+        // approach rather than building a software/shader emulation of the hardware path for
+        // Vulkan specifically.
+        let targets: Vec<(DrmNode, crtc::Handle)> = self
+            .drm_devices
+            .iter()
+            .flat_map(|(node, device)| device.inner.surfaces.keys().map(move |crtc| (*node, *crtc)))
+            .collect();
+
+        for (node, crtc) in targets {
+            let hardware_applied = (|| -> Option<()> {
+                self.color_props_for(node, crtc)?;
+                let device = self.drm_devices.get(&node)?.drm.device();
+                let props = self.color_props.get_mut(&crtc)?;
+                props.apply(device, screen_filter)
+            })()
+            .is_some();
+
+            if !hardware_applied && !screen_filter.is_noop() {
+                warn!(
+                    ?crtc,
+                    "no hardware CTM/GAMMA_LUT support - screen filter falling back to compositing shader"
+                );
+            }
+
+            if let Some(device) = self.drm_devices.get_mut(&node)
+                && let Some(surface) = device.inner.surfaces.get_mut(&crtc)
+            {
+                surface.set_screen_filter(if hardware_applied {
+                    ScreenFilter::default()
+                } else {
+                    screen_filter.clone()
+                });
             }
         }
 
