@@ -13,6 +13,7 @@ pub mod drm;
 pub mod drm_lease;
 pub mod drm_syncobj;
 pub mod foreign_toplevel_list;
+pub mod gamma_control;
 pub mod fractional_scale;
 pub mod idle_inhibit;
 pub mod idle_notify;

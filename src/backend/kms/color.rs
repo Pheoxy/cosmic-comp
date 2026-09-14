@@ -475,6 +475,7 @@ struct DrmColorLut {
 /// should log that plainly and keep using the existing GLES shader path rather than attempt any
 /// software/shader-based emulation of this on Vulkan (see the project plan: this mirrors GNOME's
 /// own approach of a hard capability gate, not a compositing fallback).
+#[derive(Debug)]
 pub struct CrtcColorProps {
     crtc: crtc::Handle,
     ctm: property::Handle,
@@ -594,6 +595,67 @@ impl CrtcColorProps {
             let _ = device.destroy_property_blob(old);
         }
         if let Some(old) = self.previous_gamma_blob.replace(gamma_blob_id).filter(|&b| b != 0) {
+            let _ = device.destroy_property_blob(old);
+        }
+        Some(())
+    }
+
+    pub fn gamma_size(&self) -> usize {
+        self.gamma_lut_size
+    }
+
+    /// Sets just the `GAMMA_LUT` property from a raw wire-format ramp (all of red, then all of
+    /// green, then all of blue - the `wlr-gamma-control-unstable-v1` protocol's own layout, not
+    /// interleaved `(r, g, b)` triples), leaving `CTM` untouched. For the gamma-control protocol
+    /// (external tools, and night light): independent of the accessibility screen filter's own
+    /// `apply`, since `CTM` and `GAMMA_LUT` are separately addressable properties - this doesn't
+    /// disturb an active colorblind-correction `CTM`, and `apply` doesn't disturb whatever this
+    /// sets either. `None` restores the default (identity) ramp.
+    pub fn apply_raw_gamma_ramp<D: ControlDevice + AsFd>(
+        &mut self,
+        device: &D,
+        ramp: Option<&[u16]>,
+    ) -> Option<()> {
+        let gamma_blob_id = match ramp {
+            Some(ramp) if ramp.len() == self.gamma_lut_size * 3 => {
+                let (red, rest) = ramp.split_at(self.gamma_lut_size);
+                let (green, blue) = rest.split_at(self.gamma_lut_size);
+                let mut lut_data: Vec<DrmColorLut> = red
+                    .iter()
+                    .zip(green.iter())
+                    .zip(blue.iter())
+                    .map(|((&red, &green), &blue)| DrmColorLut { red, green, blue, reserved: 0 })
+                    .collect();
+                let lut_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        lut_data.as_mut_ptr() as *mut u8,
+                        std::mem::size_of_val(lut_data.as_slice()),
+                    )
+                };
+                match drm_ffi::mode::create_property_blob(device.as_fd(), lut_bytes) {
+                    Ok(blob) => Some(u64::from(blob.blob_id)),
+                    Err(err) => {
+                        warn!(?err, crtc = ?self.crtc, "failed to create GAMMA_LUT property blob");
+                        return None;
+                    }
+                }
+            }
+            // Wrong size (a malformed/malicious client) - fail closed rather than either
+            // panicking on the slice split or silently ignoring the mismatch.
+            Some(_) => return None,
+            None => None,
+        };
+
+        if let Err(err) = device.set_property(self.crtc, self.gamma_lut, gamma_blob_id.unwrap_or(0)) {
+            warn!(?err, crtc = ?self.crtc, "failed to set GAMMA_LUT");
+            if let Some(id) = gamma_blob_id {
+                let _ = device.destroy_property_blob(id);
+            }
+            return None;
+        }
+
+        if let Some(old) = self.previous_gamma_blob.replace(gamma_blob_id.unwrap_or(0)).filter(|&b| b != 0)
+        {
             let _ = device.destroy_property_blob(old);
         }
         Some(())
