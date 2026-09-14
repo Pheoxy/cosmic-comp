@@ -60,6 +60,7 @@ mod device;
 mod drm_helpers;
 pub mod render;
 mod surface;
+use color::CrtcColorProps;
 use device::*;
 pub(crate) use surface::Surface;
 pub use surface::Timings;
@@ -82,6 +83,8 @@ pub struct KmsState {
     pub dmabuf_global: Option<DmabufGlobal>,
     pub(crate) syncobj_acquire_source_tokens: HashMap<u64, RegistrationToken>,
     next_syncobj_acquire_source_id: u64,
+
+    color_props: HashMap<crtc::Handle, CrtcColorProps>,
 }
 
 pub struct KmsGuard<'a> {
@@ -142,6 +145,8 @@ pub fn init_backend(
         dmabuf_global: None,
         syncobj_acquire_source_tokens: HashMap::new(),
         next_syncobj_acquire_source_id: 0,
+
+        color_props: HashMap::new(),
     });
 
     // manually add already present gpus
@@ -647,6 +652,46 @@ impl State {
 impl KmsState {
     pub fn switch_vt(&mut self, num: i32) -> Result<(), anyhow::Error> {
         self.session.change_vt(num).map_err(Into::into)
+    }
+
+    fn find_crtc_for_output(&self, output: &Output) -> Option<(DrmNode, crtc::Handle)> {
+        for (node, device) in &self.drm_devices {
+            for (crtc, surface) in device.inner.surfaces.iter() {
+                if surface.output == *output {
+                    return Some((*node, *crtc));
+                }
+            }
+        }
+        None
+    }
+
+    fn color_props_for(&mut self, node: DrmNode, crtc: crtc::Handle) -> Option<&mut CrtcColorProps> {
+        if !self.color_props.contains_key(&crtc) {
+            let device = self.drm_devices.get(&node)?;
+            let props = CrtcColorProps::probe(device.drm.device(), crtc)?;
+            self.color_props.insert(crtc, props);
+        }
+        self.color_props.get_mut(&crtc)
+    }
+
+    /// The size of an output's `GAMMA_LUT` ramp, or `None` if it (or the CRTC driving it)
+    /// doesn't support hardware `CTM`/`GAMMA_LUT` at all.
+    pub fn gamma_size(&mut self, output: &Output) -> Option<u32> {
+        let (node, crtc) = self.find_crtc_for_output(output)?;
+        Some(self.color_props_for(node, crtc)?.gamma_size() as u32)
+    }
+
+    /// Sets an output's raw `GAMMA_LUT` ramp (the `wlr-gamma-control-unstable-v1` wire format -
+    /// see [`color::CrtcColorProps::apply_raw_gamma_ramp`]), independent of the accessibility
+    /// screen filter's own `CTM`-driven state. `None` restores the default ramp.
+    pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> Option<()> {
+        let (node, crtc) = self.find_crtc_for_output(output)?;
+        // Ensure the entry exists first (a `&mut self` call, so its returned reference must be
+        // dropped before the two disjoint-field borrows below).
+        self.color_props_for(node, crtc)?;
+        let device = self.drm_devices.get(&node)?.drm.device();
+        let props = self.color_props.get_mut(&crtc)?;
+        props.apply_raw_gamma_ramp(device, ramp.as_deref())
     }
 
     pub(crate) fn next_syncobj_acquire_source_id(&mut self) -> u64 {
