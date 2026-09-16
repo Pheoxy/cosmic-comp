@@ -12,7 +12,7 @@
 use crate::config::{ColorFilter, ScreenFilter};
 use smithay::reexports::drm::control::{Device as ControlDevice, crtc, property};
 use std::os::fd::AsFd;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// A 3x3 matrix, row-major: `mat_vec(m, [r, g, b])[0] == m[0][0]*r + m[0][1]*g + m[0][2]*b`.
 pub type Matrix3 = [[f64; 3]; 3];
@@ -163,6 +163,51 @@ pub fn inverted_lut(size: usize) -> Vec<(u16, u16, u16)> {
         .into_iter()
         .map(|(r, g, b)| (0xFFFF - r, 0xFFFF - g, 0xFFFF - b))
         .collect()
+}
+
+/// Detects whether a raw wire-format `GAMMA_LUT` ramp (red, then green, then blue - the
+/// `wlr-gamma-control-unstable-v1` layout, see [`CrtcColorProps::apply_raw_gamma_ramp`]) is a
+/// pure per-channel linear scale of the identity ramp, i.e. `ramp[c][i] ==
+/// round(identity_lut(size)[i] * factor_c)` for some constant `factor_c` per channel - the
+/// shape [`temperature_lut`] (and, since it's the same blackbody-table approach `redshift`/
+/// `gammastep`/`wlsunset` all use, most real-world color-temperature tools) produces. A ramp
+/// like this is exactly a diagonal `CTM`, so a CRTC that can't write `GAMMA_LUT` at all can
+/// still apply it via hardware `CTM` instead of falling back to a shader - see `ISSUES.md` for
+/// why some hardware can't write `GAMMA_LUT`. Returns the three per-channel factors if so;
+/// samples rather than checking every entry so this stays cheap even at a large
+/// `GAMMA_LUT_SIZE`.
+fn diagonal_scale_from_ramp(ramp: &[u16], size: usize) -> Option<[f64; 3]> {
+    if size < 2 || ramp.len() != size * 3 {
+        return None;
+    }
+    let (red, rest) = ramp.split_at(size);
+    let (green, blue) = rest.split_at(size);
+    let channels = [red, green, blue];
+
+    // identity_lut's own last entry is exactly 0xFFFF, so this recovers each channel's scale
+    // factor directly from the ramp rather than guessing it.
+    let mut factors = [0.0; 3];
+    for (c, channel) in channels.iter().enumerate() {
+        factors[c] = channel[size - 1] as f64 / 0xFFFF as f64;
+    }
+
+    const SAMPLES: usize = 64;
+    // Two integer-rounding stages compound (identity_lut truncates, the scale then rounds), so
+    // allow a little more than the naive 0.5 ULP a single rounding step would need.
+    const TOLERANCE: f64 = 1.5;
+
+    for (c, channel) in channels.iter().enumerate() {
+        for s in 0..SAMPLES.min(size) {
+            let i = s * (size - 1) / (SAMPLES.min(size) - 1).max(1);
+            let identity_v = ((0xFFFFu64 * i as u64) / (size as u64 - 1)) as f64;
+            let expected = (identity_v * factors[c]).round();
+            if (channel[i] as f64 - expected).abs() > TOLERANCE {
+                return None;
+            }
+        }
+    }
+
+    Some(factors)
 }
 
 // Generated from redshift's src/colorramp.c (blackbody_color table), 1000K-25100K
@@ -481,12 +526,27 @@ pub struct CrtcColorProps {
     ctm: property::Handle,
     gamma_lut: property::Handle,
     gamma_lut_size: usize,
+    /// Whether a flat linear `GAMMA_LUT` ramp at `gamma_lut_size` is actually accepted by this
+    /// CRTC, determined once by [`Self::probe`] actually writing one rather than assumed from
+    /// the property's advertised size or any driver/vendor identity - some hardware exposes
+    /// `CTM`/`GAMMA_LUT` but rejects a flat ramp at the size it itself advertises (see
+    /// `ISSUES.md`). `CTM` is always attempted regardless of this value; only `GAMMA_LUT`-
+    /// dependent effects (screen filter's `invert`, the gamma-control protocol) are gated on it.
+    gamma_lut_writable: bool,
+    /// `CTM` contribution from the accessibility screen filter's `color_filter` (colorblind
+    /// correction/greyscale), `IDENTITY` when none is active. Composed with
+    /// `gamma_upgrade_ctm` into the one hardware `CTM` property - see [`Self::write_ctm`].
+    screen_filter_ctm: Matrix3,
+    /// `CTM` contribution from a `GAMMA_LUT` ramp that got upgraded to hardware `CTM` because
+    /// `GAMMA_LUT` itself isn't writable on this CRTC (see [`Self::apply_raw_gamma_ramp`] and
+    /// `diagonal_scale_from_ramp`), `IDENTITY` when none is active.
+    gamma_upgrade_ctm: Matrix3,
     previous_ctm_blob: Option<u64>,
     previous_gamma_blob: Option<u64>,
 }
 
 impl CrtcColorProps {
-    pub fn probe<D: ControlDevice>(device: &D, crtc: crtc::Handle) -> Option<Self> {
+    pub fn probe<D: ControlDevice + AsFd>(device: &D, crtc: crtc::Handle) -> Option<Self> {
         let props = device.get_properties(crtc).ok()?;
         let (handles, values) = props.as_props_and_values();
 
@@ -520,45 +580,50 @@ impl CrtcColorProps {
         // Zero-size GAMMA_LUT is not usable (there's nothing to build a ramp against).
         let gamma_lut_size = gamma_lut_size.filter(|&size| size > 0)?;
 
-        Some(Self {
+        let mut props = Self {
             crtc,
             ctm: ctm?,
             gamma_lut: gamma_lut?,
             gamma_lut_size,
+            gamma_lut_writable: false,
+            screen_filter_ctm: IDENTITY,
+            gamma_upgrade_ctm: IDENTITY,
             previous_ctm_blob: None,
             previous_gamma_blob: None,
-        })
+        };
+
+        // Vendor-agnostic capability probe: try writing a real flat identity ramp once, here,
+        // rather than assuming it will work from `gamma_lut_size` or any driver/vendor identity.
+        // A failure just means GAMMA_LUT-dependent effects fall back to the compositing shader
+        // on this CRTC - `CTM`-only effects are unaffected either way (see `apply` below).
+        if props
+            .set_gamma_lut(device, &identity_lut(gamma_lut_size))
+            .is_some()
+        {
+            props.gamma_lut_writable = true;
+            // Don't leave the probe's own test write as visible "previous" state - reset to the
+            // driver default so the first real `apply`/`apply_raw_gamma_ramp` call starts clean.
+            let _ = device.set_property(crtc, props.gamma_lut, 0);
+            if let Some(blob) = props.previous_gamma_blob.take() {
+                let _ = device.destroy_property_blob(blob);
+            }
+        }
+
+        Some(props)
     }
 
-    /// Uploads new `CTM`/`GAMMA_LUT` blobs for the given [`ScreenFilter`] state and sets both
-    /// CRTC properties. A blob value of `0` means "no blob" (the DRM convention for resetting a
-    /// blob property to its default/identity state), used here when `filter` is a no-op.
-    pub fn apply<D: ControlDevice + AsFd>(&mut self, device: &D, filter: &ScreenFilter) -> Option<()> {
-        let ctm_blob = filter.color_filter.map(|mode| {
-            let matrix = DrmColorCtm { matrix: encode_ctm_blob(&ctm_for(mode)) };
-            device.create_property_blob(&matrix)
-        });
-        let ctm_blob_id = match ctm_blob {
-            Some(Ok(property::Value::Blob(id))) => Some(id),
-            Some(Ok(_)) => unreachable!("create_property_blob always returns Value::Blob"),
-            Some(Err(err)) => {
-                warn!(?err, crtc = ?self.crtc, "failed to create CTM property blob");
-                return None;
-            }
-            None => None,
-        };
-
-        let lut = if filter.inverted {
-            inverted_lut(self.gamma_lut_size)
-        } else {
-            identity_lut(self.gamma_lut_size)
-        };
-        // `filter.is_noop()` (no invert, no color filter) still uploads an identity LUT rather
-        // than resetting to blob 0, so a driver's own default GAMMA_LUT (which may not be a
-        // pure identity ramp) doesn't change the picture when the filter is off.
+    /// Builds a `GAMMA_LUT` blob from `lut` and sets it as the CRTC's `GAMMA_LUT` property,
+    /// tracking the new blob (and destroying the previous one) on success. Shared by the
+    /// capability probe, [`Self::apply`], and [`Self::apply_raw_gamma_ramp`] so blob
+    /// construction and cleanup only happen in one place.
+    fn set_gamma_lut<D: ControlDevice + AsFd>(
+        &mut self,
+        device: &D,
+        lut: &[(u16, u16, u16)],
+    ) -> Option<()> {
         let mut lut_data: Vec<DrmColorLut> = lut
-            .into_iter()
-            .map(|(red, green, blue)| DrmColorLut { red, green, blue, reserved: 0 })
+            .iter()
+            .map(|&(red, green, blue)| DrmColorLut { red, green, blue, reserved: 0 })
             .collect();
         let lut_bytes: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(
@@ -570,10 +635,45 @@ impl CrtcColorProps {
             Ok(blob) => u64::from(blob.blob_id),
             Err(err) => {
                 warn!(?err, crtc = ?self.crtc, "failed to create GAMMA_LUT property blob");
-                if let Some(id) = ctm_blob_id {
-                    let _ = device.destroy_property_blob(id);
-                }
                 return None;
+            }
+        };
+        if let Err(err) = device.set_property(self.crtc, self.gamma_lut, gamma_blob_id) {
+            warn!(?err, crtc = ?self.crtc, "failed to set GAMMA_LUT");
+            let _ = device.destroy_property_blob(gamma_blob_id);
+            return None;
+        }
+        if let Some(old) = self.previous_gamma_blob.replace(gamma_blob_id).filter(|&b| b != 0) {
+            let _ = device.destroy_property_blob(old);
+        }
+        Some(())
+    }
+
+    /// Writes `mat_mul(gamma_upgrade_ctm, screen_filter_ctm)` (screen filter correction applied
+    /// first, any gamma-ramp-upgrade multiplier - see [`Self::apply_raw_gamma_ramp`] - on top) as
+    /// the one hardware `CTM` blob, since both features share the single `CTM` property and must
+    /// be composed rather than overwrite each other. Does not update `self.screen_filter_ctm`/
+    /// `self.gamma_upgrade_ctm` - callers only commit those on success, so a failed write leaves
+    /// this struct's record of hardware state consistent with whichever matrices are actually
+    /// still set.
+    fn write_ctm<D: ControlDevice>(
+        &mut self,
+        device: &D,
+        screen_filter_ctm: &Matrix3,
+        gamma_upgrade_ctm: &Matrix3,
+    ) -> Option<()> {
+        let combined = mat_mul(gamma_upgrade_ctm, screen_filter_ctm);
+        let ctm_blob_id = if combined == IDENTITY {
+            None
+        } else {
+            let matrix = DrmColorCtm { matrix: encode_ctm_blob(&combined) };
+            match device.create_property_blob(&matrix) {
+                Ok(property::Value::Blob(id)) => Some(id),
+                Ok(_) => unreachable!("create_property_blob always returns Value::Blob"),
+                Err(err) => {
+                    warn!(?err, crtc = ?self.crtc, "failed to create CTM property blob");
+                    return None;
+                }
             }
         };
 
@@ -582,20 +682,81 @@ impl CrtcColorProps {
             if let Some(id) = ctm_blob_id {
                 let _ = device.destroy_property_blob(id);
             }
-            let _ = device.destroy_property_blob(gamma_blob_id);
-            return None;
-        }
-        if let Err(err) = device.set_property(self.crtc, self.gamma_lut, gamma_blob_id) {
-            warn!(?err, crtc = ?self.crtc, "failed to set GAMMA_LUT");
-            let _ = device.destroy_property_blob(gamma_blob_id);
             return None;
         }
 
         if let Some(old) = self.previous_ctm_blob.replace(ctm_blob_id.unwrap_or(0)).filter(|&b| b != 0) {
             let _ = device.destroy_property_blob(old);
         }
-        if let Some(old) = self.previous_gamma_blob.replace(gamma_blob_id).filter(|&b| b != 0) {
-            let _ = device.destroy_property_blob(old);
+        Some(())
+    }
+
+    /// Applies the given [`ScreenFilter`] state's `color_filter` via hardware `CTM` and, only if
+    /// `filter` actually needs it, `GAMMA_LUT` too.
+    ///
+    /// `GAMMA_LUT` is only touched when `filter.inverted` is set - colorblind/greyscale
+    /// correction is pure `CTM` (a linear transform) and never needs it, so those modes keep
+    /// working in hardware on a CRTC where `CTM` is writable even if `GAMMA_LUT` isn't (see
+    /// `gamma_lut_writable`). If `invert` is requested but `GAMMA_LUT` can't be set, the `CTM`
+    /// write is rolled back and this returns `None` so the caller falls back to the compositing
+    /// shader for the whole filter - never applies colorblind correction via hardware `CTM` and
+    /// via the shader at the same time.
+    pub fn apply<D: ControlDevice + AsFd>(&mut self, device: &D, filter: &ScreenFilter) -> Option<()> {
+        let old_screen_filter_ctm = self.screen_filter_ctm;
+        let new_screen_filter_ctm = filter.color_filter.map(ctm_for).unwrap_or(IDENTITY);
+        let gamma_upgrade_ctm = self.gamma_upgrade_ctm;
+
+        self.write_ctm(device, &new_screen_filter_ctm, &gamma_upgrade_ctm)?;
+        self.screen_filter_ctm = new_screen_filter_ctm;
+
+        let gamma_ok = if filter.inverted {
+            self.gamma_lut_writable
+                && self.set_gamma_lut(device, &inverted_lut(self.gamma_lut_size)).is_some()
+        } else if self.previous_gamma_blob.is_some_and(|b| b != 0) {
+            // Invert just turned off - reset GAMMA_LUT back to the driver default.
+            match device.set_property(self.crtc, self.gamma_lut, 0) {
+                Ok(()) => {
+                    if let Some(old) = self.previous_gamma_blob.take() {
+                        let _ = device.destroy_property_blob(old);
+                    }
+                    true
+                }
+                Err(err) => {
+                    warn!(?err, crtc = ?self.crtc, "failed to reset GAMMA_LUT");
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if !gamma_ok {
+            // Roll the CTM back so we don't apply colorblind correction via hardware while the
+            // caller falls back to the shader for the whole filter. `write_ctm`'s own blob-
+            // create-then-set_property sequence means a *failed* call never mutates hardware -
+            // it either fully applies the requested matrix or leaves the previous one in place -
+            // so the two outcomes below are exhaustive, and `self.screen_filter_ctm` is set to
+            // whichever one is actually now on hardware, never to a value that might not match
+            // reality. A revert failure is logged at `error!`, not `warn!`, since it leaves a
+            // real, externally-visible symptom (the compositing shader about to run will now
+            // double up on colorblind correction the hardware CTM is still applying) that a
+            // developer would otherwise have no way to notice from behavior alone.
+            match self.write_ctm(device, &old_screen_filter_ctm, &gamma_upgrade_ctm) {
+                Some(()) => {
+                    self.screen_filter_ctm = old_screen_filter_ctm;
+                }
+                None => {
+                    error!(
+                        crtc = ?self.crtc,
+                        "failed to roll back CTM after a GAMMA_LUT failure - hardware still \
+                         shows the new screen filter CTM, which the compositing shader \
+                         fallback will now also apply on top of until the next successful \
+                         `apply` call resyncs it"
+                    );
+                    self.screen_filter_ctm = new_screen_filter_ctm;
+                }
+            }
+            return None;
         }
         Some(())
     }
@@ -611,53 +772,58 @@ impl CrtcColorProps {
     /// `apply`, since `CTM` and `GAMMA_LUT` are separately addressable properties - this doesn't
     /// disturb an active colorblind-correction `CTM`, and `apply` doesn't disturb whatever this
     /// sets either. `None` restores the default (identity) ramp.
+    ///
+    /// If `!gamma_lut_writable()`, this doesn't just give up: a `ramp` that's a pure per-channel
+    /// linear scale (see `diagonal_scale_from_ramp`) - which is what night light's own
+    /// `temperature_lut`, and most real-world color-temperature tools, actually produce - gets
+    /// upgraded to a hardware `CTM` instead, composed with any active screen-filter `CTM` rather
+    /// than overwriting it (see [`Self::write_ctm`]). Only a genuinely non-diagonal ramp (some
+    /// arbitrary curve a client is free to request under the protocol) falls back to `None` here,
+    /// for the caller to handle with a compositing shader.
     pub fn apply_raw_gamma_ramp<D: ControlDevice + AsFd>(
         &mut self,
         device: &D,
         ramp: Option<&[u16]>,
     ) -> Option<()> {
-        let gamma_blob_id = match ramp {
-            Some(ramp) if ramp.len() == self.gamma_lut_size * 3 => {
-                let (red, rest) = ramp.split_at(self.gamma_lut_size);
-                let (green, blue) = rest.split_at(self.gamma_lut_size);
-                let mut lut_data: Vec<DrmColorLut> = red
-                    .iter()
-                    .zip(green.iter())
-                    .zip(blue.iter())
-                    .map(|((&red, &green), &blue)| DrmColorLut { red, green, blue, reserved: 0 })
-                    .collect();
-                let lut_bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        lut_data.as_mut_ptr() as *mut u8,
-                        std::mem::size_of_val(lut_data.as_slice()),
-                    )
-                };
-                match drm_ffi::mode::create_property_blob(device.as_fd(), lut_bytes) {
-                    Ok(blob) => Some(u64::from(blob.blob_id)),
-                    Err(err) => {
-                        warn!(?err, crtc = ?self.crtc, "failed to create GAMMA_LUT property blob");
-                        return None;
-                    }
+        if self.gamma_lut_writable {
+            return match ramp {
+                Some(ramp) if ramp.len() == self.gamma_lut_size * 3 => {
+                    let (red, rest) = ramp.split_at(self.gamma_lut_size);
+                    let (green, blue) = rest.split_at(self.gamma_lut_size);
+                    let lut: Vec<(u16, u16, u16)> = red
+                        .iter()
+                        .zip(green.iter())
+                        .zip(blue.iter())
+                        .map(|((&red, &green), &blue)| (red, green, blue))
+                        .collect();
+                    self.set_gamma_lut(device, &lut)
                 }
+                // Wrong size (a malformed/malicious client) - fail closed rather than either
+                // panicking on the slice split or silently ignoring the mismatch.
+                Some(_) => None,
+                None => {
+                    if self.previous_gamma_blob.is_some_and(|b| b != 0) {
+                        device.set_property(self.crtc, self.gamma_lut, 0).ok()?;
+                        if let Some(old) = self.previous_gamma_blob.take() {
+                            let _ = device.destroy_property_blob(old);
+                        }
+                    }
+                    Some(())
+                }
+            };
+        }
+
+        let new_gamma_upgrade_ctm = match ramp {
+            Some(ramp) => {
+                let [r, g, b] = diagonal_scale_from_ramp(ramp, self.gamma_lut_size)?;
+                [[r, 0.0, 0.0], [0.0, g, 0.0], [0.0, 0.0, b]]
             }
-            // Wrong size (a malformed/malicious client) - fail closed rather than either
-            // panicking on the slice split or silently ignoring the mismatch.
-            Some(_) => return None,
-            None => None,
+            None => IDENTITY,
         };
 
-        if let Err(err) = device.set_property(self.crtc, self.gamma_lut, gamma_blob_id.unwrap_or(0)) {
-            warn!(?err, crtc = ?self.crtc, "failed to set GAMMA_LUT");
-            if let Some(id) = gamma_blob_id {
-                let _ = device.destroy_property_blob(id);
-            }
-            return None;
-        }
-
-        if let Some(old) = self.previous_gamma_blob.replace(gamma_blob_id.unwrap_or(0)).filter(|&b| b != 0)
-        {
-            let _ = device.destroy_property_blob(old);
-        }
+        let screen_filter_ctm = self.screen_filter_ctm;
+        self.write_ctm(device, &screen_filter_ctm, &new_gamma_upgrade_ctm)?;
+        self.gamma_upgrade_ctm = new_gamma_upgrade_ctm;
         Some(())
     }
 
@@ -809,5 +975,79 @@ mod tests {
             let expected_r = (inverted[i].0 as f64 * wp[0]).round() as u16;
             assert_eq!(lut[i].0, expected_r);
         }
+    }
+
+    /// Converts a `(r, g, b)`-triple LUT (`identity_lut`/`temperature_lut`'s own shape) into the
+    /// raw wire-format ramp `diagonal_scale_from_ramp`/`apply_raw_gamma_ramp` take (all red, then
+    /// all green, then all blue).
+    fn to_wire_format(lut: &[(u16, u16, u16)]) -> Vec<u16> {
+        lut.iter()
+            .map(|&(r, _, _)| r)
+            .chain(lut.iter().map(|&(_, g, _)| g))
+            .chain(lut.iter().map(|&(_, _, b)| b))
+            .collect()
+    }
+
+    #[test]
+    fn diagonal_scale_from_ramp_detects_temperature_lut() {
+        let size = 256;
+        for kelvin in [2000, 3500, 5000, 6500, 10000] {
+            let wire = to_wire_format(&temperature_lut(size, kelvin, false));
+            let factors =
+                diagonal_scale_from_ramp(&wire, size).expect("temperature_lut is a diagonal scale");
+            let expected = white_point_for_temperature(kelvin);
+            // The factor is recovered from a single quantized u16 LUT entry (~1/65535 max
+            // error), unlike `assert_close`'s exact-matrix-math tolerance - a difference this
+            // small is visually meaningless, so allow for it explicitly here.
+            for i in 0..3 {
+                assert!(
+                    (factors[i] - expected[i]).abs() < 1e-4,
+                    "component {i} differs beyond LUT quantization noise: {:?} vs {:?}",
+                    factors,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagonal_scale_from_ramp_detects_identity() {
+        let size = 256;
+        let wire = to_wire_format(&identity_lut(size));
+        let factors = diagonal_scale_from_ramp(&wire, size).expect("identity is a diagonal scale");
+        assert_close(factors, [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn diagonal_scale_from_ramp_rejects_inverted_lut() {
+        // `invert` is affine (1 - x), not a linear scale through the origin - must not be
+        // misdetected as one, or it would silently render wrong via a CTM upgrade.
+        let size = 256;
+        let wire = to_wire_format(&inverted_lut(size));
+        assert!(diagonal_scale_from_ramp(&wire, size).is_none());
+    }
+
+    #[test]
+    fn diagonal_scale_from_ramp_rejects_arbitrary_curve() {
+        let size = 256;
+        // A gamma-2.2-style curve: not a linear scale of the identity ramp at any single factor.
+        let mut lut = identity_lut(size);
+        for (i, (r, g, b)) in lut.iter_mut().enumerate() {
+            let x = i as f64 / (size - 1) as f64;
+            let v = (x.powf(2.2) * 0xFFFF as f64).round() as u16;
+            *r = v;
+            *g = v;
+            *b = v;
+        }
+        let wire = to_wire_format(&lut);
+        assert!(diagonal_scale_from_ramp(&wire, size).is_none());
+    }
+
+    #[test]
+    fn diagonal_scale_from_ramp_rejects_wrong_size() {
+        let size = 256;
+        let wire = to_wire_format(&identity_lut(size));
+        assert!(diagonal_scale_from_ramp(&wire, size + 1).is_none());
+        assert!(diagonal_scale_from_ramp(&wire[..wire.len() - 1], size).is_none());
     }
 }
