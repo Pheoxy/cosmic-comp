@@ -28,6 +28,7 @@ use smithay::{
     backend::{
         allocator::{
             Fourcc,
+            dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBuffer},
         },
@@ -43,8 +44,8 @@ use smithay::{
         },
         egl::EGLContext,
         renderer::{
-            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
-            TextureFilter, buffer_dimensions, buffer_type,
+            Bind, Blit, BufferType, Frame, ImportDma, Offscreen, RenderTargetLifecycle, Renderer,
+            RendererSuper, Texture, TextureFilter, buffer_dimensions, buffer_type,
             damage::Error as RenderError,
             element::{
                 Element, Kind, RenderElementStates,
@@ -1983,7 +1984,6 @@ fn send_screencopy_result_vulkan<'a>(
 
     let (damage, _) = res?;
 
-    let mut sync = SyncPoint::default();
     let mut dmabuf_clone;
     let mut render_buffer;
     let buffer = frame.buffer();
@@ -2021,92 +2021,121 @@ fn send_screencopy_result_vulkan<'a>(
         )
     };
 
-    if let Some(ref damage) = damage {
-        let (output_size, output_scale, output_transform) = (
-            output.current_mode().ok_or(OutputNoMode)?.size,
-            output.current_scale().fractional_scale(),
-            output.current_transform(),
-        );
+    // `bind` above marks this dmabuf's Vulkan render-target image as locally owned - the renderer
+    // will refuse to bind it again until that's released, either by a successful `Frame::finish`
+    // (not reached on this screencopy-only path) or explicitly via `RenderTargetLifecycle`. A bare
+    // `?` from here on would leave it stuck locally-owned forever on any failure, since nothing
+    // else releases it: every later screencopy attempt against the same dmabuf identity would then
+    // fail immediately with "dmabuf render-target still locally owned" instead of retrying
+    // cleanly next frame. Everything fallible after the bind is scoped into this closure so a
+    // failure can be caught once and released before propagating.
+    let result: Result<()> = (|| {
+        let mut sync = SyncPoint::default();
 
-        let filter = (!session.draw_cursor())
-            .then(|| {
-                elements.iter().filter_map(|elem| {
-                    if let CosmicElement::Cursor(_) = elem {
-                        Some(elem.id().clone())
-                    } else {
-                        None
-                    }
+        if let Some(ref damage) = damage {
+            let (output_size, output_scale, output_transform) = (
+                output.current_mode().ok_or(OutputNoMode)?.size,
+                output.current_scale().fractional_scale(),
+                output.current_transform(),
+            );
+
+            let filter = (!session.draw_cursor())
+                .then(|| {
+                    elements.iter().filter_map(|elem| {
+                        if let CosmicElement::Cursor(_) = elem {
+                            Some(elem.id().clone())
+                        } else {
+                            None
+                        }
+                    })
                 })
-            })
-            .into_iter()
-            .flatten();
+                .into_iter()
+                .flatten();
 
-        // If the screen is rotated, we must convert damage to match output.
-        let adjusted = damage
-            .iter()
-            .copied()
-            .map(|rect| {
-                let logical = rect.to_logical(1);
-                logical
-                    .to_buffer(
-                        1,
-                        output_transform.invert(),
-                        &buffer_size.to_logical(1, output_transform),
-                    )
-                    .to_logical(1, Transform::Normal, &buffer_size)
-                    .to_physical(1)
-            })
-            .collect::<Vec<_>>();
+            // If the screen is rotated, we must convert damage to match output.
+            let adjusted = damage
+                .iter()
+                .copied()
+                .map(|rect| {
+                    let logical = rect.to_logical(1);
+                    logical
+                        .to_buffer(
+                            1,
+                            output_transform.invert(),
+                            &buffer_size.to_logical(1, output_transform),
+                        )
+                        .to_logical(1, Transform::Normal, &buffer_size)
+                        .to_physical(1)
+                })
+                .collect::<Vec<_>>();
 
-        sync = frame_result
-            .blit_frame_result(
-                output_size,
-                output_transform,
-                output_scale,
-                renderer,
-                fb.as_mut().unwrap(),
-                adjusted,
-                filter,
-            )
-            .map_err(|err| match err {
-                BlitFrameResultError::Rendering(err) => {
-                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
-                }
-                BlitFrameResultError::Export(_) => {
-                    RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
-                        MultiError::DeviceMissing,
-                    )
-                }
-            })?;
-    }
+            sync = frame_result
+                .blit_frame_result(
+                    output_size,
+                    output_transform,
+                    output_scale,
+                    renderer,
+                    fb.as_mut().unwrap(),
+                    adjusted,
+                    filter,
+                )
+                .map_err(|err| match err {
+                    BlitFrameResultError::Rendering(err) => {
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(err)
+                    }
+                    BlitFrameResultError::Export(_) => {
+                        RenderError::<<VulkanMultiRenderer as RendererSuper>::Error>::Rendering(
+                            MultiError::DeviceMissing,
+                        )
+                    }
+                })?;
+        }
 
-    let transform = output.current_transform();
+        let transform = output.current_transform();
 
-    if let Some(data) = submit_buffer(
-        frame,
-        renderer,
-        shm_buffer.then_some(fb.as_mut().unwrap()),
-        transform,
-        damage.as_deref(),
-        sync,
-        // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
-        vec![],
-        CaptureSessionRef::Session(session.clone()),
-        // This runs on `SurfaceThreadState`'s event loop, not `State`'s, so the vulkan SHM-copy
-        // deferral (which needs `&mut State`) is unavailable here; `false` keeps the original
-        // eager/blocking copy for this path, matching the output-capture path in render/mod.rs.
-        None,
-        false,
-    )? {
-        if frame_result.is_empty {
-            data.frame
-                .success(transform, data.damage, presentation_time);
-        } else {
-            let _ = tx.send(data);
+        if let Some(data) = submit_buffer(
+            frame,
+            renderer,
+            shm_buffer.then_some(fb.as_mut().unwrap()),
+            transform,
+            damage.as_deref(),
+            sync,
+            // Don't reference `Buffer`s since we blit from framebuffer/postprocess buffer
+            vec![],
+            CaptureSessionRef::Session(session.clone()),
+            // This runs on `SurfaceThreadState`'s event loop, not `State`'s, so the vulkan SHM-copy
+            // deferral (which needs `&mut State`) is unavailable here; `false` keeps the original
+            // eager/blocking copy for this path, matching the output-capture path in render/mod.rs.
+            None,
+            false,
+        )? {
+            if frame_result.is_empty {
+                data.frame
+                    .success(transform, data.damage, presentation_time);
+            } else {
+                let _ = tx.send(data);
+            }
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // `Dmabuf` here names which `Bind`/`RenderTargetLifecycle` impl to use, not which of the
+        // two branches above actually bound `fb` - the SHM/offscreen `VulkanRenderTarget` branch
+        // has no cached dmabuf identity to release, so this is a harmless no-op for it and a real
+        // release for the dmabuf-backed one.
+        if let Err(release_err) =
+            RenderTargetLifecycle::<Dmabuf>::release_after_render_error(renderer, fb.as_mut().unwrap())
+        {
+            warn!(
+                ?release_err,
+                "Failed to release screencopy render target after a failed capture"
+            );
         }
     }
 
-    Ok(())
+    result
 }
 
 fn send_screencopy_result_gles<'a>(
