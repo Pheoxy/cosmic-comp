@@ -711,7 +711,15 @@ impl KmsState {
         self.color_props_for(node, crtc)?;
         let device = self.drm_devices.get(&node)?.drm.device();
         let props = self.color_props.get_mut(&crtc)?;
-        props.apply_raw_gamma_ramp(device, ramp.as_deref())
+        let result = props.apply_raw_gamma_ramp(device, ramp.as_deref());
+        if result.is_none() && ramp.is_some() {
+            // `apply_raw_gamma_ramp` already tries a hardware CTM upgrade for a ramp shaped like
+            // a plain per-channel scale (see `diagonal_scale_from_ramp`) before giving up, so
+            // reaching here means this CRTC can express neither GAMMA_LUT nor an equivalent CTM
+            // for the requested ramp - there's currently no further fallback for this case.
+            warn!(?crtc, "gamma ramp not applied - unsupported on this CRTC");
+        }
+        result
     }
 
     pub(crate) fn next_syncobj_acquire_source_id(&mut self) -> u64 {
