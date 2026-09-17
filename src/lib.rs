@@ -36,17 +36,6 @@ use clap_lex::RawArgs;
 
 use std::error::Error;
 
-/// Set by `cosmic-greeter-start.sh` on the greeter's `cosmic-comp` instance only - gates the
-/// handoff behavior below so a normal desktop session never takes this path on exit.
-const HANDOFF_ENV_VAR: &str = "COSMIC_GREETER_HANDOFF";
-/// Records the pid of a still-lingering handoff holder (see `start_handoff_holder`) so the
-/// *next* greeter instance to start on the same VT can reap it - see `reap_stale_handoff_holder`.
-const HANDOFF_PIDFILE: &str = "/run/cosmic-greeter/handoff.pid";
-
-fn is_handoff_mode() -> bool {
-    env::var_os(HANDOFF_ENV_VAR).is_some()
-}
-
 pub mod backend;
 pub mod config;
 pub mod dbus;
@@ -160,10 +149,6 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     logger::init_logger()?;
     info!("Cosmic starting up!");
 
-    if is_handoff_mode() {
-        reap_stale_handoff_holder();
-    }
-
     profiling::register_thread!("Main Thread");
     #[cfg(feature = "profile-with-tracy")]
     tracy_client::Client::start();
@@ -265,22 +250,6 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
 
     let kiosk_exit_code = state.common.kiosk_exit_code;
 
-    // Greeter handoff: on a clean login (kiosk child exited 0) hand the display off to the
-    // incoming session instead of tearing it down here. greetd won't start the user session
-    // until this process exits either way (it's not a subreaper and blocks in waitpid() on
-    // exactly this pid), and systemd-logind unconditionally forces the VT back to the text
-    // console the moment our logind/libseat control connection closes - with no check for
-    // whether a successor has since taken the VT over - so the only way to avoid that blank
-    // is to keep that connection (and our DRM fds) open past this point. See
-    // `start_handoff_holder` for how.
-    // `start_handoff_holder` only returns at all if `fork()` itself failed - both of its
-    // success paths end in either an infinite sleep (the holder child) or `process::exit`
-    // (this process, once the holder is confirmed running), so falling through to the normal
-    // teardown below is exactly the right behavior on its one failure path too.
-    if is_handoff_mode() && kiosk_exit_code == Some(0) {
-        start_handoff_holder();
-    }
-
     // Join surface threads before exit() so no thread is mid-eglCreateSync when
     // Mesa's atexit handlers run and corrupt the heap (issue #2375). Safe here
     // because the event loop has stopped; an unconditional join in Surface::Drop
@@ -306,91 +275,6 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
-}
-
-/// Kills any handoff holder process left behind by a previous login on this VT (see
-/// `start_handoff_holder`) and clears its pidfile. Only ever relevant right as a *new* greeter
-/// instance starts, which only happens after a logout - i.e. at a point where the VT is already
-/// resetting to a fresh greeter, so the kill's own `session_restore_vt` side effect (see
-/// `start_handoff_holder`'s doc comment) isn't separately visible.
-fn reap_stale_handoff_holder() {
-    let Ok(contents) = std::fs::read_to_string(HANDOFF_PIDFILE) else {
-        return;
-    };
-    if let Ok(pid) = contents.trim().parse::<i32>() {
-        // The holder is a forked (never exec'd) child of a past `cosmic-comp`, so its /proc
-        // comm is still "cosmic-comp" - check that before SIGKILLing a pid read from a file,
-        // in case the pidfile is stale enough that the kernel has since reused that pid for an
-        // unrelated process.
-        let is_our_holder = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .is_ok_and(|comm| comm.trim() == "cosmic-comp");
-        if is_our_holder {
-            // SIGKILL: the holder does nothing but block in pause(), no cleanup needed or
-            // wanted - it holding stale fds open is the whole point, right up until now.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(HANDOFF_PIDFILE);
-}
-
-/// Forks a holder process that inherits every fd this process currently has open - most
-/// importantly the DRM device fds and the logind/libseat session-control connection - and then
-/// does nothing but block forever, while this process exits immediately without running any of
-/// its usual teardown.
-///
-/// This matters because `systemd-logind`'s `session_restore_vt()` (which forces the VT back to
-/// the text console) only ever fires when our logind session's *controller* connection actually
-/// closes, or when the session record itself gets garbage-collected - never on a plain PAM
-/// session stop, and never while some process (any process) keeps that connection open. As long
-/// as the holder keeps breathing, our CRTC/connector/framebuffer state stays exactly as the
-/// kernel and logind already see it, so the incoming session's own compositor reads it as
-/// unchanged and its first frame is a plain page-flip instead of a disruptive blank-and-reset.
-///
-/// Deliberately does *not* wait for the incoming session to actually take over before exiting:
-/// greetd only starts that session once this process (specifically, the one it originally
-/// spawned) has exited, so there is nothing to wait for here - by construction, the incoming
-/// session cannot even begin starting until after we've already handed off.
-///
-/// Returns only if `fork()` itself failed, so the caller can fall back to normal teardown; both
-/// success paths (the holder child, and this process after recording the holder's pid) never
-/// return.
-fn start_handoff_holder() {
-    match unsafe { libc::fork() } {
-        -1 => {
-            warn!("Handoff fork failed, falling back to normal shutdown");
-        }
-        0 => {
-            // Child, immediately post-fork in a process that was multithreaded a moment ago:
-            // fork() only duplicates the calling thread, so every other thread (and any lock
-            // one of them happened to hold, heap allocator included) simply doesn't exist here
-            // anymore - only async-signal-safe operations are valid. No allocation, no Rust
-            // destructors, nothing but blocking forever holding the inherited fds open.
-            loop {
-                unsafe {
-                    libc::pause();
-                }
-            }
-        }
-        pid => {
-            let _ = std::fs::create_dir_all("/run/cosmic-greeter");
-            if let Err(err) = std::fs::write(HANDOFF_PIDFILE, pid.to_string()) {
-                warn!(?err, "Failed to record handoff holder pid");
-            }
-            info!(holder_pid = pid, "Handing display off to incoming session");
-            // `std::process::exit` only skips Rust destructors - it still runs libc atexit
-            // handlers, including Mesa's, with our surface threads still alive (the exact
-            // heap-corruption scenario issue #2375's join-before-exit above exists to avoid,
-            // except here it can also just hang: an atexit handler blocking on a lock a live
-            // render thread holds means this process - and therefore greetd's waitpid on it,
-            // and therefore the login - never completes). `_exit` bypasses atexit entirely,
-            // which is what "exit without running any teardown" actually requires here.
-            unsafe {
-                libc::_exit(0);
-            }
-        }
-    }
 }
 
 fn print_help(version: &str, git_rev: &str) {

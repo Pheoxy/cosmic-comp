@@ -81,10 +81,6 @@ xkbcommon = "0.9"
 zbus = "5.14.0"
 profiling = { version = "1.0" }
 rustix = { version = "1.1.4", features = ["process"] }
-# fork()/pause()/kill() for the greeter handoff holder (see run() in lib.rs) - not exposed
-# by rustix, and needs to be usable from a signal-unsafe context right after fork() in the
-# child, so we call the raw libc functions directly rather than adding a wrapper crate.
-libc = "0.2"
 rand = "0.10"
 # CLI arguments
 clap_lex = "1.0"
