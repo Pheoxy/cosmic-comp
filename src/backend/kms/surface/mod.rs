@@ -1984,6 +1984,13 @@ fn send_screencopy_result_vulkan<'a>(
 
     let (damage, _) = res?;
 
+    // Capture-cost probe: this whole function runs on the output's render thread
+    // inside the frame path, so its wall time is directly the delay it adds to
+    // the next frame. Logged once per serviced capture.
+    let capture_started = std::time::Instant::now();
+    let mut blit_us: u64 = 0;
+    let damage_rects = damage.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
+
     let mut dmabuf_clone;
     let mut render_buffer;
     let buffer = frame.buffer();
@@ -2069,6 +2076,7 @@ fn send_screencopy_result_vulkan<'a>(
                 })
                 .collect::<Vec<_>>();
 
+            let blit_started = std::time::Instant::now();
             sync = frame_result
                 .blit_frame_result(
                     output_size,
@@ -2089,6 +2097,7 @@ fn send_screencopy_result_vulkan<'a>(
                         )
                     }
                 })?;
+            blit_us = blit_started.elapsed().as_micros() as u64;
         }
 
         let transform = output.current_transform();
@@ -2134,6 +2143,17 @@ fn send_screencopy_result_vulkan<'a>(
             );
         }
     }
+
+    tracing::debug!(
+        output = output.name(),
+        shm = shm_buffer,
+        buffer = ?buffer_size,
+        damage_rects = damage_rects,
+        blit_us,
+        total_us = capture_started.elapsed().as_micros() as u64,
+        ok = result.is_ok(),
+        "screencopy: capture serviced on render thread"
+    );
 
     result
 }
