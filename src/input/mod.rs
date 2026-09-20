@@ -327,6 +327,17 @@ impl State {
             InputEvent::PointerMotion { event, .. } => {
                 use smithay::backend::input::PointerMotionEvent;
 
+                // Input-to-dispatch latency probe: libinput stamps events with
+                // CLOCK_MONOTONIC; anything the main thread was blocked on
+                // (an X11 round-trip, a lock) shows up here as delay.
+                {
+                    let now = smithay::backend::input::InputTime::now().micros();
+                    let delay_us = now.saturating_sub(event.time().micros());
+                    if delay_us > 4_000 {
+                        tracing::debug!(delay_ms = delay_us / 1000, "pointer motion dispatched late");
+                    }
+                }
+
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell
                     .seats
@@ -653,22 +664,28 @@ impl State {
                             .and_then(|k| k.current_focus())
                             .is_some_and(|f| f.has_surface(&shell, &under));
 
-                        if is_focused {
-                            with_pointer_constraint(&under, &ptr, |constraint| match constraint {
-                                Some(constraint) if !constraint.is_active() => {
-                                    let region = match &*constraint {
-                                        PointerConstraint::Locked(locked) => locked.region(),
-                                        PointerConstraint::Confined(confined) => confined.region(),
-                                    };
-                                    let point =
-                                        (ptr.current_location() - surface_location).to_i32_floor();
-                                    if region.is_none_or(|region| region.contains(point)) {
-                                        constraint.activate();
-                                    }
+                        with_pointer_constraint(&under, &ptr, |constraint| match constraint {
+                            Some(constraint) if !constraint.is_active() => {
+                                let region = match &*constraint {
+                                    PointerConstraint::Locked(locked) => locked.region(),
+                                    PointerConstraint::Confined(confined) => confined.region(),
+                                };
+                                let point =
+                                    (ptr.current_location() - surface_location).to_i32_floor();
+                                let in_region = region.is_none_or(|region| region.contains(point));
+                                if is_focused && in_region {
+                                    constraint.activate();
                                 }
-                                _ => {}
-                            });
-                        }
+                                tracing::debug!(
+                                    surface = under.id().protocol_id(),
+                                    is_focused,
+                                    in_region,
+                                    activated = is_focused && in_region,
+                                    "pointer constraint: inactive constraint under pointer on motion"
+                                );
+                            }
+                            _ => {}
+                        });
                     }
 
                     let mut shell = self.common.shell.write();

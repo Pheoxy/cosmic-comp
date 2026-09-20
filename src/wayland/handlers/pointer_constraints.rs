@@ -3,6 +3,7 @@
 use crate::{shell::CosmicSurface, state::State, utils::prelude::*};
 use smithay::{
     input::pointer::PointerHandle,
+    reexports::wayland_server::Resource,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point},
     wayland::{
@@ -60,6 +61,7 @@ impl PointerConstraintsHandler for State {
             (false, false, None)
         };
 
+        let mut activated = false;
         if is_focused && is_under {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
@@ -70,21 +72,35 @@ impl PointerConstraintsHandler for State {
                             && region.contains(point)
                         {
                             constraint.activate();
+                            activated = true;
                         }
                     } else {
                         constraint.activate();
+                        activated = true;
                     }
                 }
             });
         }
+        tracing::debug!(
+            surface = surface.id().protocol_id(),
+            is_focused,
+            is_under,
+            activated,
+            "pointer constraint: new_constraint"
+        );
     }
 
     fn remove_constraint(
         &mut self,
         surface: &WlSurface,
         pointer: &PointerHandle<Self>,
-        _constraint_remove: ConstraintRemove,
+        constraint_remove: ConstraintRemove,
     ) {
+        tracing::debug!(
+            surface = surface.id().protocol_id(),
+            reason = ?constraint_remove,
+            "pointer constraint: remove_constraint"
+        );
         if with_pointer_constraint(surface, pointer, |constraint| constraint.is_none()) {
             let seat = self
                 .common
@@ -111,6 +127,11 @@ impl PointerConstraintsHandler for State {
         pointer: &PointerHandle<Self>,
         location: Point<f64, Logical>,
     ) {
+        tracing::debug!(
+            surface = surface.id().protocol_id(),
+            ?location,
+            "pointer constraint: cursor_position_hint"
+        );
         if with_pointer_constraint(surface, pointer, |constraint| {
             constraint.is_some_and(|c| c.is_active())
         }) {
