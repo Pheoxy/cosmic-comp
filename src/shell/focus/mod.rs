@@ -377,6 +377,12 @@ fn update_focus_state(
         {
             with_pointer_constraint(&surface, &pointer, |constraint| {
                 if let Some(constraint) = constraint {
+                    tracing::debug!(
+                        surface = surface.id().protocol_id(),
+                        was_active = constraint.is_active(),
+                        new_target = ?target.map(|t| t.wl_surface().map(|s| s.id().protocol_id())),
+                        "pointer constraint: deactivate on keyboard focus change"
+                    );
                     constraint.deactivate();
                 }
             });
